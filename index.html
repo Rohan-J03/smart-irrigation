@@ -1,337 +1,161 @@
-#include <WiFi.h>
-#include <WebServer.h>
-#include <Preferences.h>
-#include <HTTPClient.h>
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Smart Irrigation Pro Dashboard</title>
+    <!-- Tailwind CSS -->
+    <script src="https://cdn.tailwindcss.com"></script>
+    <!-- FontAwesome Icons -->
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
+</head>
+<body class="bg-slate-100 text-slate-800 font-sans p-4 sm:p-6 flex flex-col items-center min-h-screen">
 
-// --- ADAFRUIT IO HTTP REST API CREDENTIALS ---
-#define AIO_USERNAME  "Your_Adafruit_IO_Username"
-#define AIO_KEY       "aio_Your_Adafruit_IO_Key_Here"
+    <div class="max-w-2xl w-full bg-white rounded-2xl shadow-xl border border-slate-200 overflow-hidden">
+        
+        <!-- Header -->
+        <div class="bg-emerald-600 text-white p-5 flex justify-between items-center">
+            <div class="flex items-center space-x-3">
+                <div class="w-10 h-10 bg-white/20 rounded-xl flex items-center justify-center text-xl">
+                    <i class="fa-solid fa-leaf"></i>
+                </div>
+                <div>
+                    <h1 class="text-lg font-bold tracking-wide">Smart Irrigation PRO</h1>
+                    <p class="text-xs text-emerald-100">Cloud Connected Dashboard</p>
+                </div>
+            </div>
+            <div class="bg-white/10 px-3 py-1 rounded-full text-xs font-semibold flex items-center space-x-1.5">
+                <span class="w-2 h-2 rounded-full bg-emerald-400 animate-pulse"></span>
+                <span id="connection-status">Cloud Live</span>
+            </div>
+        </div>
 
-// --- HARDWARE PIN DEFINITIONS ---
-const int SOIL_PIN = 34;    // Capacitive Soil Moisture Sensor (Analog ADC1_CH6)
-const int RELAY_PIN = 26;   // 230V Solenoid Valve Relay
+        <!-- Main Content Grid -->
+        <div class="p-5 space-y-4">
+            
+            <div class="grid grid-cols-1 sm:grid-cols-2 gap-4">
+                <!-- Soil Moisture Card -->
+                <div class="bg-slate-50 p-4 rounded-xl border border-slate-200 text-center flex flex-col justify-between">
+                    <span class="text-xs font-bold text-slate-400 uppercase tracking-wider">Soil Moisture Sensor</span>
+                    <div class="my-3">
+                        <span id="soil-display" class="text-3xl font-black text-slate-800">--</span>
+                        <span class="text-xs text-slate-500 block mt-1">ADC Value</span>
+                    </div>
+                    <span id="soil-status" class="text-xs font-semibold px-2 py-1 bg-slate-200 text-slate-600 rounded-md">Fetching data...</span>
+                </div>
 
-// --- CREDENTIALS & SECURE AP HOTSPOT CONFIG ---
-const char* default_ssid = "YourHomeWiFi";
-const char* default_pass = "YourWiFiPassword";
-const char* ap_ssid = "SmartIrrigation_AP";
-const char* ap_password = "securepassword123"; // Must be at least 8 characters
+                <!-- Valve Status Card -->
+                <div class="bg-slate-50 p-4 rounded-xl border border-slate-200 text-center flex flex-col justify-between">
+                    <span class="text-xs font-bold text-slate-400 uppercase tracking-wider">230V Solenoid Valve</span>
+                    <div class="my-3">
+                        <div id="valve-badge" class="inline-block px-4 py-1.5 rounded-full text-sm font-bold bg-slate-200 text-slate-600">
+                            UNKNOWN
+                        </div>
+                    </div>
+                    <span class="text-xs text-slate-500">Hardware Relay #1</span>
+                </div>
+            </div>
 
-WebServer server(80);
-Preferences preferences;
+            <!-- Operational Control Panel -->
+            <div class="bg-emerald-50 p-4 rounded-xl border border-emerald-200 space-y-3">
+                <h2 class="text-xs font-bold text-emerald-800 uppercase tracking-wider"><i class="fa-solid fa-sliders mr-1.5"></i> Manual Cloud Overrides</h2>
+                
+                <div class="flex gap-3">
+                    <button onclick="sendCloudCommand('valve-status', 1)" class="flex-1 py-2.5 px-4 bg-emerald-600 hover:bg-emerald-700 text-white font-bold text-xs rounded-xl shadow-md transition flex items-center justify-center space-x-2">
+                        <i class="fa-solid fa-faucet-drip"></i>
+                        <span>Force Open Valve</span>
+                    </button>
+                    
+                    <button onclick="sendCloudCommand('valve-status', 0)" class="flex-1 py-2.5 px-4 bg-slate-600 hover:bg-slate-700 text-white font-bold text-xs rounded-xl shadow-md transition flex items-center justify-center space-x-2">
+                        <i class="fa-solid fa-ban"></i>
+                        <span>Force Close Valve</span>
+                    </button>
+                </div>
+            </div>
 
-// --- SYSTEM STATES & LIMITS ---
-bool autoMode = true;
-bool manualWater = false;
-bool emergencyStop = false;
-bool isCloudConnected = false;
+        </div>
 
-unsigned long waterLimitMinutes = 1;  
-unsigned long cooldownLimitHours = 3;
+        <!-- Footer -->
+        <div class="bg-slate-50 p-3 text-center text-[10px] text-slate-400 border-t border-slate-200">
+            Powered by GitHub Pages & Adafruit IO REST API
+        </div>
 
-unsigned long wateringStartTime = 0;
-unsigned long cooldownEndTime = 0; 
+    </div>
 
-// Thresholds & Validation
-int dryThreshold = 2800;   
-int wetThreshold = 1200;   
-int minValidAdc = 200;     
-int maxValidAdc = 3800;    
+    <!-- JavaScript Integration Script -->
+    <script>
+        // REPLACE THESE WITH YOUR ACTUAL ADAFRUIT IO CREDENTIALS
+        const AIO_USERNAME = "Your_Adafruit_IO_Username";
+        const AIO_KEY = "aio_Your_Adafruit_IO_Key_Here";
 
-// Forward Declarations of Handlers
-void handleRoot();
-void handleToggleAuto();
-void handleToggleManual();
-void handleEStop();
-void handleResetEStop();
-void handleResetCooldown();
-void sendAdafruitData(String feedName, float value);
-void triggerCooldown();
-void revertToAutoAndCooldown();
+        // Function to fetch latest feed data from Adafruit IO
+        function fetchTelemetry() {
+            // Fetch Soil Moisture
+            fetch(`https://io.adafruit.com/api/v2/${AIO_USERNAME}/feeds/soil-moisture/data/last`, {
+                headers: { 'X-AIO-Key': AIO_KEY }
+            })
+            .then(res => res.json())
+            .then(data => {
+                let adcVal = parseInt(data.value);
+                document.getElementById('soil-display').innerText = adcVal + " ADC";
+                
+                let statusEl = document.getElementById('soil-status');
+                if (adcVal >= 2800) {
+                    statusEl.innerText = "Dry (Needs Water)";
+                    statusEl.className = "text-xs font-semibold px-2 py-1 bg-amber-100 text-amber-700 rounded-md";
+                } else {
+                    statusEl.innerText = "Optimal Moisture";
+                    statusEl.className = "text-xs font-semibold px-2 py-1 bg-emerald-100 text-emerald-700 rounded-md";
+                }
+            })
+            .catch(err => console.error("Error fetching soil moisture:", err));
 
-void setup() {
-  Serial.begin(115200);
-  delay(1000);
-
-  pinMode(SOIL_PIN, INPUT);
-  pinMode(RELAY_PIN, OUTPUT);
-  digitalWrite(RELAY_PIN, LOW); // Safe default: Valve Closed
-
-  // Load Non-Volatile Storage (NVS)
-  preferences.begin("irrigation", false);
-  waterLimitMinutes = preferences.getULong("waterLimit", 1);
-  cooldownLimitHours = preferences.getULong("cooldownLimit", 3);
-  cooldownEndTime = preferences.getULong("cooldownEnd", 0);
-  autoMode = preferences.getBool("autoMode", true);
-
-  if (cooldownEndTime > millis()) {
-    Serial.println("Restored active cooldown state from NVS flash.");
-  } else {
-    cooldownEndTime = 0;
-  }
-
-  // --- WI-FI CONNECTION ATTEMPT (30s TIMEOUT) ---
-  WiFi.mode(WIFI_STA);
-  WiFi.begin(default_ssid, default_pass);
-  Serial.print("Connecting to Home Wi-Fi");
-  
-  unsigned long startAttemptTime = millis();
-  while (WiFi.status() != WL_CONNECTED && millis() - startAttemptTime < 30000) {
-    delay(500);
-    Serial.print(".");
-  }
-
-  // --- CONNECTION ROUTING: CLOUD READY VS OFFLINE SECURE AP ---
-  if (WiFi.status() == WL_CONNECTED) {
-    Serial.println("\nConnected to Home Wi-Fi successfully!");
-    Serial.print("👉 OPEN THIS IP IN YOUR BROWSER: http://");
-    Serial.println(WiFi.localIP());
-    isCloudConnected = true;
-  } else {
-    Serial.println("\nWi-Fi timeout (>30s). Starting Secure Local AP Hotspot...");
-    
-    WiFi.mode(WIFI_AP);
-    WiFi.softAP(ap_ssid, ap_password);
-    
-    IPAddress IP = WiFi.softAPIP();
-    Serial.print("👉 CONNECT TO WIFI: ");
-    Serial.println(ap_ssid);
-    Serial.print("👉 PASSWORD: ");
-    Serial.println(ap_password);
-    Serial.print("👉 OPEN THIS IP IN YOUR BROWSER: http://");
-    Serial.println(IP); // Usually 192.168.4.1
-    
-    isCloudConnected = false;
-  }
-
-  // --- LOCAL WEB SERVER ROUTE ENDPOINTS ---
-  server.on("/", handleRoot);
-  server.on("/toggleAuto", handleToggleAuto);
-  server.on("/toggleManual", handleToggleManual);
-  server.on("/estop", handleEStop);
-  server.on("/resetEstop", handleResetEStop);
-  server.on("/resetCooldown", handleResetCooldown);
-  server.begin();
-  Serial.println("Local Web Server Started and listening.");
-}
-
-void loop() {
-  server.handleClient();
-
-  int soilAdc = analogRead(SOIL_PIN);
-  unsigned long currentMillis = millis();
-
-  bool sensorFault = (soilAdc < minValidAdc || soilAdc > maxValidAdc);
-  bool isCooldownActive = (cooldownEndTime > currentMillis);
-
-  // --- AUTOMATION & SAFETY LOGIC ---
-  if (emergencyStop || sensorFault) {
-    if (digitalRead(RELAY_PIN) == HIGH) {
-      digitalWrite(RELAY_PIN, LOW);
-      sendAdafruitData("valve-status", 0);
-      Serial.println("Safety Interlock Engaged: Valve forced CLOSED.");
-    }
-    wateringStartTime = 0;
-  } else {
-    if (autoMode && !isCooldownActive) {
-      if (soilAdc >= dryThreshold) {
-        if (wateringStartTime == 0) {
-          wateringStartTime = currentMillis;
-          digitalWrite(RELAY_PIN, HIGH); 
-          sendAdafruitData("valve-status", 1);
-          Serial.println("Auto Watering Started: Soil is dry.");
-        } else if ((currentMillis - wateringStartTime) >= (waterLimitMinutes * 60000UL)) {
-          digitalWrite(RELAY_PIN, LOW);
-          sendAdafruitData("valve-status", 0);
-          wateringStartTime = 0;
-          triggerCooldown();
-          Serial.println("Max watering duration reached. Cooldown initiated.");
+            // Fetch Valve Status
+            fetch(`https://io.adafruit.com/api/v2/${AIO_USERNAME}/feeds/valve-status/data/last`, {
+                headers: { 'X-AIO-Key': AIO_KEY }
+            })
+            .then(res => res.json())
+            .then(data => {
+                let valveOpen = parseInt(data.value) === 1;
+                let badge = document.getElementById('valve-badge');
+                if (valveOpen) {
+                    badge.innerText = "OPEN (ON)";
+                    badge.className = "inline-block px-4 py-1.5 rounded-full text-sm font-bold bg-emerald-100 text-emerald-700";
+                } else {
+                    badge.innerText = "CLOSED";
+                    badge.className = "inline-block px-4 py-1.5 rounded-full text-sm font-bold bg-slate-200 text-slate-600";
+                }
+            })
+            .catch(err => console.error("Error fetching valve status:", err));
         }
-      } else {
-        if (wateringStartTime != 0) {
-          digitalWrite(RELAY_PIN, LOW);
-          sendAdafruitData("valve-status", 0);
-          wateringStartTime = 0;
-          triggerCooldown();
-          Serial.println("Soil optimal. Watering completed, cooldown initiated.");
+
+        // Function to send command data back to Adafruit IO feed
+        function sendCloudCommand(feedName, value) {
+            fetch(`https://io.adafruit.com/api/v2/${AIO_USERNAME}/feeds/${feedName}/data`, {
+                method: 'POST',
+                headers: {
+                    'Content-Type': 'application/json',
+                    'X-AIO-Key': AIO_KEY
+                },
+                body: JSON.stringify({ value: value })
+            })
+            .then(res => res.json())
+            .then(data => {
+                console.log(`Command sent to ${feedName}:`, data);
+                alert("Command sent successfully to ESP32 via cloud!");
+                setTimeout(fetchTelemetry, 1000); // Refresh UI after brief delay
+            })
+            .catch(err => {
+                console.error("Error posting command:", err);
+                alert("Failed to send command.");
+            });
         }
-      }
-    } else if (manualWater) {
-      if ((currentMillis - wateringStartTime) >= (waterLimitMinutes * 60000UL)) {
-        digitalWrite(RELAY_PIN, LOW);
-        sendAdafruitData("valve-status", 0);
-        manualWater = false;
-        wateringStartTime = 0;
-        revertToAutoAndCooldown();
-        Serial.println("Manual max duration reached. Reverting to Auto & Cooldown.");
-      }
-    }
-  }
 
-  // Periodic Telemetry & State Save (every 10 seconds)
-  static unsigned long lastSyncTime = 0;
-  if (currentMillis - lastSyncTime > 10000) {
-    lastSyncTime = currentMillis;
-    
-    if (isCloudConnected && WiFi.status() == WL_CONNECTED) {
-      sendAdafruitData("soil-moisture", soilAdc);
-    }
-    
-    preferences.putULong("cooldownEnd", cooldownEndTime);
-    preferences.putBool("autoMode", autoMode);
-  }
-}
-
-// --- HELPER: POST DATA TO ADAFRUIT IO VIA HTTP REST ---
-void sendAdafruitData(String feedName, float value) {
-  if (!isCloudConnected || WiFi.status() != WL_CONNECTED) return;
-
-  HTTPClient http;
-  String url = "http://io.adafruit.com/api/v2/" + String(AIO_USERNAME) + "/feeds/" + feedName + "/data";
-  
-  http.begin(url);
-  http.addHeader("Content-Type", "application/json");
-  http.addHeader("X-AIO-Key", AIO_KEY);
-
-  String payload = "{\"value\":\"" + String(value) + "\"}";
-  int httpResponseCode = http.POST(payload);
-  
-  if (httpResponseCode > 0) {
-    Serial.print("Adafruit IO HTTP POST success for ");
-    Serial.print(feedName);
-    Serial.print(": ");
-    Serial.println(httpResponseCode);
-  } else {
-    Serial.print("Adafruit IO HTTP Error on ");
-    Serial.print(feedName);
-    Serial.print(": ");
-    Serial.println(httpResponseCode);
-  }
-  http.end();
-}
-
-void triggerCooldown() {
-  cooldownEndTime = millis() + (cooldownLimitHours * 3600000UL);
-  preferences.putULong("cooldownEnd", cooldownEndTime);
-}
-
-void revertToAutoAndCooldown() {
-  autoMode = true;
-  preferences.putBool("autoMode", autoMode);
-  triggerCooldown();
-}
-
-// --- LIGHT THEME LOCAL WEB SERVER UI HANDLER ---
-void handleRoot() {
-  int soilAdc = analogRead(SOIL_PIN);
-  bool isCooldownActive = (cooldownEndTime > millis());
-  bool valveOpen = digitalRead(RELAY_PIN);
-  
-  String html = "<!DOCTYPE html><html lang='en'><head><meta charset='UTF-8'>";
-  html += "<meta name='viewport' content='width=device-width, initial-scale=1'>";
-  html += "<title>Smart Irrigation Pro - Local AP</title>";
-  html += "<script src='https://cdn.tailwindcss.com'></script>";
-  html += "<link rel='stylesheet' href='https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css'>";
-  html += "</head><body class='bg-slate-100 text-slate-800 font-sans p-4 sm:p-6 flex flex-col items-center min-h-screen'>";
-  
-  html += "<div class='max-w-md w-full bg-white rounded-2xl shadow-xl border border-slate-200 overflow-hidden'>";
-  
-  html += "<div class='bg-emerald-600 text-white p-5 text-center'>";
-  html += "<div class='w-12 h-12 bg-white/20 rounded-xl mx-auto flex items-center justify-center text-2xl mb-2'><i class='fa-solid fa-leaf'></i></div>";
-  html += "<h1 class='text-xl font-bold tracking-wide'>Smart Irrigation Pro</h1>";
-  html += "<p class='text-xs text-emerald-100 mt-0.5'>Status: " + String(isCloudConnected ? "Cloud Connected" : "Secure AP Mode") + "</p>";
-  html += "</div>";
-
-  html += "<div class='p-5 space-y-4'>";
-
-  html += "<div class='grid grid-cols-2 gap-3 text-center'>";
-  html += "<div class='bg-slate-50 p-3 rounded-xl border border-slate-200'>";
-  html += "<span class='text-[10px] font-bold text-slate-400 uppercase tracking-wider block'>Soil Sensor</span>";
-  html += "<span class='text-lg font-black text-slate-800'>" + String(soilAdc) + " ADC</span>";
-  html += "</div>";
-
-  html += "<div class='bg-slate-50 p-3 rounded-xl border border-slate-200'>";
-  html += "<span class='text-[10px] font-bold text-slate-400 uppercase tracking-wider block'>Valve Status</span>";
-  if (valveOpen) {
-    html += "<span class='text-xs font-bold text-emerald-600 bg-emerald-100 px-2 py-0.5 rounded inline-block mt-1'>OPEN (ON)</span>";
-  } else {
-    html += "<span class='text-xs font-bold text-slate-500 bg-slate-200 px-2 py-0.5 rounded inline-block mt-1'>CLOSED</span>";
-  }
-  html += "</div>";
-  html += "</div>";
-
-  html += "<div class='bg-emerald-50 p-3 rounded-xl border border-emerald-200 text-xs space-y-1.5'>";
-  html += "<div class='flex justify-between font-medium'><span class='text-slate-600'>System Mode:</span><strong class='text-emerald-700'>" + String(autoMode ? "Automatic Mode" : "Manual Mode") + "</strong></div>";
-  html += "<div class='flex justify-between font-medium'><span class='text-slate-600'>Cooldown Active:</span><strong class='" + String(isCooldownActive ? "text-amber-600" : "text-emerald-700") + "'>" + String(isCooldownActive ? "YES (Locked)" : "NO (Ready)") + "</strong></div>";
-  html += "</div>";
-
-  html += "<div class='space-y-2 pt-2'>";
-  html += "<a href='/toggleAuto' class='block w-full py-2.5 px-4 bg-slate-100 hover:bg-slate-200 text-slate-700 font-bold text-xs rounded-xl text-center border border-slate-300 transition shadow-sm'><i class='fa-solid fa-sliders mr-2'></i> Toggle Auto/Manual Mode</a>";
-  html += "<a href='/toggleManual' class='block w-full py-2.5 px-4 bg-emerald-600 hover:bg-emerald-700 text-white font-bold text-xs rounded-xl text-center transition shadow-md shadow-emerald-600/30'><i class='fa-solid fa-faucet-drip mr-2'></i> Toggle Manual Water</a>";
-  html += "<a href='/resetCooldown' class='block w-full py-2.5 px-4 bg-amber-500 hover:bg-amber-600 text-white font-bold text-xs rounded-xl text-center transition shadow-sm'><i class='fa-solid fa-rotate-left mr-2'></i> Reset Cooldown Lockout</a>";
-  html += "<a href='/estop' class='block w-full py-2.5 px-4 bg-rose-600 hover:bg-rose-700 text-white font-bold text-xs rounded-xl text-center transition shadow-md shadow-rose-600/30'><i class='fa-solid fa-triangle-exclamation mr-2'></i> EMERGENCY STOP</a>";
-  html += "<a href='/resetEstop' class='block w-full py-2 px-4 bg-slate-200 hover:bg-slate-300 text-slate-700 font-bold text-xs rounded-xl text-center transition'>Reset E-Stop</a>";
-  html += "</div>";
-
-  html += "</div>";
-  html += "<div class='bg-slate-50 p-3 text-center text-[10px] text-slate-400 border-t border-slate-200'>ESP32 HTTP REST & Local Server</div>";
-  html += "</div></body></html>";
-  
-  server.send(200, "text/html", html);
-}
-
-void handleToggleAuto() {
-  autoMode = !autoMode;
-  preferences.putBool("autoMode", autoMode);
-  if (autoMode) manualWater = false;
-  server.sendHeader("Location", "/", true);
-  server.send(303);
-}
-
-void handleToggleManual() {
-  if (cooldownEndTime > millis()) {
-    server.send(400, "text/plain", "BLOCKED: Cooldown active!");
-    return;
-  }
-  if (!autoMode) {
-    manualWater = !manualWater;
-    if (manualWater) {
-      wateringStartTime = millis();
-      digitalWrite(RELAY_PIN, HIGH);
-      sendAdafruitData("valve-status", 1);
-    } else {
-      digitalWrite(RELAY_PIN, LOW);
-      sendAdafruitData("valve-status", 0);
-      wateringStartTime = 0;
-      revertToAutoAndCooldown();
-    }
-  } else {
-    server.send(400, "text/plain", "BLOCKED: Turn off Auto Mode first.");
-    return;
-  }
-  server.sendHeader("Location", "/", true);
-  server.send(303);
-}
-
-void handleEStop() {
-  emergencyStop = true;
-  digitalWrite(RELAY_PIN, LOW);
-  sendAdafruitData("valve-status", 0);
-  manualWater = false;
-  wateringStartTime = 0;
-  server.sendHeader("Location", "/", true);
-  server.send(303);
-}
-
-void handleResetEStop() {
-  emergencyStop = false;
-  server.sendHeader("Location", "/", true);
-  server.send(303);
-}
-
-void handleResetCooldown() {
-  cooldownEndTime = 0;
-  preferences.putULong("cooldownEnd", 0);
-  server.sendHeader("Location", "/", true);
-  server.send(303);
-}
+        // Poll cloud feeds every 10 seconds automatically
+        setInterval(fetchTelemetry, 10000);
+        
+        // Fetch immediately on page load
+        fetchTelemetry();
+    </script>
+</body>
+</html>
