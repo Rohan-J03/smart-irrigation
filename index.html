@@ -241,7 +241,7 @@
 
                     <!-- Quick Info Note -->
                     <p class="text-[11px] text-emerald-400/50 mt-4 italic text-center">
-                        * Turning off manual mode automatically reverts system to Auto Mode & triggers cooldown.
+                        * Cooldown lockouts and auto-reversion fully enforced.
                     </p>
                 </div>
 
@@ -535,22 +535,37 @@
                 manualWater = false;
                 addLogEntry("Automatic Mode Enabled.");
             } else {
-                manualCard.classList.remove('opacity-50', 'pointer-events-none');
+                // If cooldown is active, prevent manual unlock
+                if (cooldownSecondsRemaining > 0) {
+                    manualCard.classList.add('opacity-50', 'pointer-events-none');
+                    addLogEntry("Auto Mode Disabled, but Manual Override locked due to ACTIVE COOLDOWN.");
+                } else {
+                    manualCard.classList.remove('opacity-50', 'pointer-events-none');
+                }
                 activeModeLabel.innerText = "MANUAL MODE";
-                addLogEntry("Automatic Mode Disabled. Manual controls unlocked.");
+                addLogEntry("Automatic Mode Disabled.");
             }
             updateValveState();
         }
 
         // MANUAL WATER TOGGLE SWITCH
         function handleManualToggle(checkbox) {
+            // Safety Interlock: Block manual watering if Cooldown is active
+            if (cooldownSecondsRemaining > 0) {
+                checkbox.checked = false;
+                manualWater = false;
+                alert("MANUAL OVERRIDE BLOCKED: Cooldown period is currently active! Please wait or reset the cooldown first.");
+                addLogEntry("⚠️ Manual water attempt blocked by Cooldown Lockout.");
+                return;
+            }
+
             manualWater = checkbox.checked;
 
             if (manualWater) {
                 addLogEntry("Manual Water Command Triggered.");
                 startWateringCycle();
             } else {
-                addLogEntry("Manual Water Turned Off.");
+                addLogEntry("Manual Water Turned Off. Reverting to Auto & starting Cooldown.");
                 stopWateringCycle();
                 
                 // 1. Force Automatic Mode back ON
@@ -644,7 +659,11 @@
         function startCooldownCycle() {
             cooldownSecondsRemaining = cooldownLimitHours * 3600;
             updateTimerDisplays();
-            addLogEntry(`Cooldown cycle started (${cooldownLimitHours} hours).`);
+            addLogEntry(`Cooldown cycle started (${cooldownLimitHours} hours). Manual override locked.`);
+
+            // Lock manual switch card during cooldown
+            const manualCard = document.getElementById('manual-switch-card');
+            if (manualCard) manualCard.classList.add('opacity-50', 'pointer-events-none');
 
             if (cooldownTimerInterval) clearInterval(cooldownTimerInterval);
             cooldownTimerInterval = setInterval(() => {
@@ -654,6 +673,11 @@
                 } else {
                     clearInterval(cooldownTimerInterval);
                     addLogEntry("Cooldown period completed. System ready.");
+                    
+                    // Unlock manual switch if auto mode is off
+                    if (!autoMode) {
+                        if (manualCard) manualCard.classList.remove('opacity-50', 'pointer-events-none');
+                    }
                     updateValveState();
                 }
             }, 1000);
@@ -664,6 +688,13 @@
             if (cooldownTimerInterval) clearInterval(cooldownTimerInterval);
             updateTimerDisplays();
             updateValveState();
+            
+            // Unlock manual switch if auto mode is off
+            const manualCard = document.getElementById('manual-switch-card');
+            if (!autoMode && manualCard) {
+                manualCard.classList.remove('opacity-50', 'pointer-events-none');
+            }
+            
             addLogEntry("Cooldown lockout reset manually.");
         }
 
