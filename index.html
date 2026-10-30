@@ -1,0 +1,150 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+  <title>Smart Irrigation Pro - Adafruit IO</title>
+  <script src="https://cdnjs.cloudflare.com/ajax5/libs/paho-mqtt/1.0.1/mqttws31.min.js"></script>
+  <style>
+    :root {
+      --bg-start: #06110d; --bg-end: #0c1f18;
+      --card-bg: rgba(15, 35, 27, 0.9); --card-border: rgba(46, 125, 85, 0.35);
+      --primary: #10b981; --accent: #34d399; --text-main: #f0fdf4;
+      --text-muted: #86efac; --danger: #ef4444; --warning: #f59e0b;
+      --dark-surf: #040d0a; --radius: 10px;
+    }
+    * { box-sizing: border-box; margin: 0; padding: 0; -webkit-tap-highlight-color: transparent; }
+    html, body {
+      height: 100%; width: 100%; overflow-y: auto;
+      background: linear-gradient(135deg, var(--bg-start), var(--bg-end));
+      color: var(--text-main); font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+      font-size: 13px;
+    }
+    .container { max-width: 800px; margin: 0 auto; display: flex; flex-direction: column; padding: 10px; gap: 8px; padding-bottom: 40px; }
+    .header { background: rgba(6, 25, 18, 0.95); border: 1px solid var(--card-border); border-radius: var(--radius); padding: 8px 12px; display: flex; justify-content: space-between; align-items: center; }
+    .brand { font-size: 0.9rem; font-weight: 800; color: #fff; }
+    .badge { padding: 2px 8px; border-radius: 10px; font-size: 0.65rem; font-weight: 700; text-transform: uppercase; }
+    .badge-success { background: rgba(16, 185, 129, 0.2); color: var(--accent); border: 1px solid rgba(16, 185, 129, 0.4); }
+    .badge-warning { background: rgba(245, 158, 11, 0.2); color: var(--warning); border: 1px solid rgba(245, 158, 11, 0.4); }
+    .card { background: var(--card-bg); border: 1px solid var(--card-border); border-radius: var(--radius); padding: 10px 12px; }
+    details.card { padding: 0; overflow: hidden; }
+    details summary { padding: 10px 12px; cursor: pointer; font-size: 0.75rem; text-transform: uppercase; letter-spacing: 0.05em; color: var(--text-muted); font-weight: 700; display: flex; justify-content: space-between; align-items: center; background: rgba(4, 13, 10, 0.4); }
+    details[open] summary { border-bottom: 1px solid var(--card-border); }
+    .card-body { padding: 10px 12px; }
+    .card-title { font-size: 0.75rem; text-transform: uppercase; letter-spacing: 0.05em; color: var(--text-muted); margin-bottom: 8px; display: flex; justify-content: space-between; font-weight: 700; }
+    .grid-2 { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
+    .metric-val { font-size: 1.6rem; font-weight: 800; color: #fff; }
+    .progress-bar { height: 6px; width: 100%; background: var(--dark-surf); border-radius: 3px; overflow: hidden; margin: 6px 0; }
+    .progress-fill { height: 100%; width: 0%; background: linear-gradient(90deg, #059669, var(--accent)); transition: width 0.3s; }
+    .switch-row { display: flex; align-items: center; justify-content: space-between; padding: 4px 0; font-size: 0.8rem; font-weight: 600; }
+    .switch { position: relative; display: inline-block; width: 42px; height: 22px; }
+    .switch input { opacity: 0; width: 0; height: 0; }
+    .slider { position: absolute; cursor: pointer; top: 0; left: 0; right: 0; bottom: 0; background-color: rgba(255,255,255,0.1); transition: .3s; border-radius: 20px; border: 1px solid var(--card-border); }
+    .slider:before { position: absolute; content: ""; height: 16px; width: 16px; left: 2px; bottom: 2px; background-color: #fff; transition: .3s; border-radius: 50%; }
+    input:checked + .slider { background-color: var(--primary); }
+    input:checked + .slider:before { transform: translateX(20px); }
+    .btn { width: 100%; padding: 8px; border-radius: 6px; border: none; font-size: 0.8rem; font-weight: 700; cursor: pointer; text-align: center; }
+    .btn-danger { background: var(--danger); color: #fff; }
+    .btn-warning { background: var(--warning); color: #000; }
+  </style>
+</head>
+<body>
+
+  <div class="container">
+    <header class="header">
+      <div class="brand">Smart Irrigation Pro (Cloud)</div>
+      <div id="connBadge" class="badge badge-warning"><span id="connText">Connecting...</span></div>
+    </header>
+
+    <!-- SECTION 1: SENSOR -->
+    <details class="card" open>
+      <summary><span>1. Soil & Status</span><span>▼</span></summary>
+      <div class="card-body">
+        <div class="grid-2">
+          <div>
+            <div class="card-title">Soil Moisture</div>
+            <div class="metric-val" id="adcValue">----</div>
+            <div class="progress-bar"><div id="adcBar" class="progress-fill"></div></div>
+          </div>
+          <div>
+            <div class="card-title">Valve State</div>
+            <div id="valveText" style="font-size:1.4rem; font-weight:800; color:#fff;">OFF</div>
+          </div>
+        </div>
+      </div>
+    </details>
+
+    <!-- SECTION 2: CONTROLS -->
+    <details class="card" open>
+      <summary><span>2. Hardware Controls</span><span>▼</span></summary>
+      <div class="card-body">
+        <div class="switch-row">
+          <span>Automatic Mode</span>
+          <label class="switch"><input type="checkbox" id="autoSwitch" onchange="publishFeed('auto-mode', this.checked?1:0)"><span class="slider"></span></label>
+        </div>
+        <div class="switch-row" style="margin-bottom:8px;">
+          <span>Manual Water</span>
+          <label class="switch"><input type="checkbox" id="manualSwitch" onchange="publishFeed('manual-water', this.checked?1:0)"><span class="slider"></span></label>
+        </div>
+        <button class="btn btn-danger" onclick="publishFeed('emergency-stop', 1)">EMERGENCY STOP</button>
+      </div>
+    </details>
+  </div>
+
+  <script>
+    // REPLACE THESE WITH YOUR ADAFRUIT IO DETAILS
+    const AIO_USERNAME = "YOUR_AIO_USERNAME";
+    const AIO_KEY = "YOUR_AIO_KEY";
+
+    const clientId = "web_client_" + Math.random().toString(16).substring(2, 8);
+    const client = new Paho.MQTT.Client("io.adafruit.com", 8443, clientId);
+
+    client.onConnectionLost = response => {
+      document.getElementById('connText').textContent = 'Disconnected';
+      document.getElementById('connBadge').className = 'badge badge-warning';
+    };
+
+    client.onMessageArrived = message => {
+      const topicParts = message.destinationName.split('/');
+      const feedName = topicParts[topicParts.length - 1];
+      const val = message.payloadString;
+
+      if (feedName === 'soil-moisture') {
+        document.getElementById('adcValue').textContent = val;
+        document.getElementById('adcBar').style.width = `${Math.min((Number(val)/4095)*100, 100)}%`;
+      } else if (feedName === 'valve-state') {
+        const on = Number(val) === 1;
+        document.getElementById('valveText').textContent = on ? 'OPEN (ON)' : 'OFF';
+        document.getElementById('valveText').style.color = on ? 'var(--primary)' : '#fff';
+      } else if (feedName === 'auto-mode') {
+        document.getElementById('autoSwitch').checked = Number(val) === 1;
+      } else if (feedName === 'manual-water') {
+        document.getElementById('manualSwitch').checked = Number(val) === 1;
+      }
+    };
+
+    client.connect({
+      useSSL: true,
+      userName: AIO_USERNAME,
+      password: AIO_KEY,
+      onSuccess: () => {
+        document.getElementById('connText').textContent = 'Connected';
+        document.getElementById('connBadge').className = 'badge badge-success';
+        // Subscribe to your feeds
+        client.subscribe(`${AIO_USERNAME}/feeds/#`);
+      },
+      onFailure: () => {
+        document.getElementById('connText').textContent = 'Failed';
+      }
+    });
+
+    function publishFeed(feedName, value) {
+      if (client.isConnected()) {
+        message = new Paho.MQTT.Message(String(value));
+        message.destinationName = `${AIO_USERNAME}/feeds/${feedName}`;
+        client.send(message);
+      }
+    }
+  </script>
+</body>
+</html>
