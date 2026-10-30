@@ -1,807 +1,337 @@
-<!DOCTYPE html>
-<html lang="en">
-<head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Smart Irrigation Pro Dashboard</title>
-    <!-- Tailwind CSS -->
-    <script src="https://cdn.tailwindcss.com"></script>
-    <!-- FontAwesome Icons -->
-    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
-    <script>
-        tailwind.config = {
-            darkMode: 'class',
-            theme: {
-                extend: {
-                    colors: {
-                        forest: {
-                            50: '#f0fdf4',
-                            100: '#dcfce7',
-                            200: '#bbf7d0',
-                            600: '#16a34a',
-                            700: '#15803d',
-                            800: '#166534',
-                            900: '#14532d',
-                            950: '#052e16',
-                        },
-                        emerald: {
-                            500: '#10b981',
-                            600: '#059669',
-                            700: '#047857',
-                        }
-                    }
-                }
-            }
+#include <WiFi.h>
+#include <WebServer.h>
+#include <Preferences.h>
+#include <HTTPClient.h>
+
+// --- ADAFRUIT IO HTTP REST API CREDENTIALS ---
+#define AIO_USERNAME  "Your_Adafruit_IO_Username"
+#define AIO_KEY       "aio_Your_Adafruit_IO_Key_Here"
+
+// --- HARDWARE PIN DEFINITIONS ---
+const int SOIL_PIN = 34;    // Capacitive Soil Moisture Sensor (Analog ADC1_CH6)
+const int RELAY_PIN = 26;   // 230V Solenoid Valve Relay
+
+// --- CREDENTIALS & SECURE AP HOTSPOT CONFIG ---
+const char* default_ssid = "YourHomeWiFi";
+const char* default_pass = "YourWiFiPassword";
+const char* ap_ssid = "SmartIrrigation_AP";
+const char* ap_password = "securepassword123"; // Must be at least 8 characters
+
+WebServer server(80);
+Preferences preferences;
+
+// --- SYSTEM STATES & LIMITS ---
+bool autoMode = true;
+bool manualWater = false;
+bool emergencyStop = false;
+bool isCloudConnected = false;
+
+unsigned long waterLimitMinutes = 1;  
+unsigned long cooldownLimitHours = 3;
+
+unsigned long wateringStartTime = 0;
+unsigned long cooldownEndTime = 0; 
+
+// Thresholds & Validation
+int dryThreshold = 2800;   
+int wetThreshold = 1200;   
+int minValidAdc = 200;     
+int maxValidAdc = 3800;    
+
+// Forward Declarations of Handlers
+void handleRoot();
+void handleToggleAuto();
+void handleToggleManual();
+void handleEStop();
+void handleResetEStop();
+void handleResetCooldown();
+void sendAdafruitData(String feedName, float value);
+void triggerCooldown();
+void revertToAutoAndCooldown();
+
+void setup() {
+  Serial.begin(115200);
+  delay(1000);
+
+  pinMode(SOIL_PIN, INPUT);
+  pinMode(RELAY_PIN, OUTPUT);
+  digitalWrite(RELAY_PIN, LOW); // Safe default: Valve Closed
+
+  // Load Non-Volatile Storage (NVS)
+  preferences.begin("irrigation", false);
+  waterLimitMinutes = preferences.getULong("waterLimit", 1);
+  cooldownLimitHours = preferences.getULong("cooldownLimit", 3);
+  cooldownEndTime = preferences.getULong("cooldownEnd", 0);
+  autoMode = preferences.getBool("autoMode", true);
+
+  if (cooldownEndTime > millis()) {
+    Serial.println("Restored active cooldown state from NVS flash.");
+  } else {
+    cooldownEndTime = 0;
+  }
+
+  // --- WI-FI CONNECTION ATTEMPT (30s TIMEOUT) ---
+  WiFi.mode(WIFI_STA);
+  WiFi.begin(default_ssid, default_pass);
+  Serial.print("Connecting to Home Wi-Fi");
+  
+  unsigned long startAttemptTime = millis();
+  while (WiFi.status() != WL_CONNECTED && millis() - startAttemptTime < 30000) {
+    delay(500);
+    Serial.print(".");
+  }
+
+  // --- CONNECTION ROUTING: CLOUD READY VS OFFLINE SECURE AP ---
+  if (WiFi.status() == WL_CONNECTED) {
+    Serial.println("\nConnected to Home Wi-Fi successfully!");
+    Serial.print("👉 OPEN THIS IP IN YOUR BROWSER: http://");
+    Serial.println(WiFi.localIP());
+    isCloudConnected = true;
+  } else {
+    Serial.println("\nWi-Fi timeout (>30s). Starting Secure Local AP Hotspot...");
+    
+    WiFi.mode(WIFI_AP);
+    WiFi.softAP(ap_ssid, ap_password);
+    
+    IPAddress IP = WiFi.softAPIP();
+    Serial.print("👉 CONNECT TO WIFI: ");
+    Serial.println(ap_ssid);
+    Serial.print("👉 PASSWORD: ");
+    Serial.println(ap_password);
+    Serial.print("👉 OPEN THIS IP IN YOUR BROWSER: http://");
+    Serial.println(IP); // Usually 192.168.4.1
+    
+    isCloudConnected = false;
+  }
+
+  // --- LOCAL WEB SERVER ROUTE ENDPOINTS ---
+  server.on("/", handleRoot);
+  server.on("/toggleAuto", handleToggleAuto);
+  server.on("/toggleManual", handleToggleManual);
+  server.on("/estop", handleEStop);
+  server.on("/resetEstop", handleResetEStop);
+  server.on("/resetCooldown", handleResetCooldown);
+  server.begin();
+  Serial.println("Local Web Server Started and listening.");
+}
+
+void loop() {
+  server.handleClient();
+
+  int soilAdc = analogRead(SOIL_PIN);
+  unsigned long currentMillis = millis();
+
+  bool sensorFault = (soilAdc < minValidAdc || soilAdc > maxValidAdc);
+  bool isCooldownActive = (cooldownEndTime > currentMillis);
+
+  // --- AUTOMATION & SAFETY LOGIC ---
+  if (emergencyStop || sensorFault) {
+    if (digitalRead(RELAY_PIN) == HIGH) {
+      digitalWrite(RELAY_PIN, LOW);
+      sendAdafruitData("valve-status", 0);
+      Serial.println("Safety Interlock Engaged: Valve forced CLOSED.");
+    }
+    wateringStartTime = 0;
+  } else {
+    if (autoMode && !isCooldownActive) {
+      if (soilAdc >= dryThreshold) {
+        if (wateringStartTime == 0) {
+          wateringStartTime = currentMillis;
+          digitalWrite(RELAY_PIN, HIGH); 
+          sendAdafruitData("valve-status", 1);
+          Serial.println("Auto Watering Started: Soil is dry.");
+        } else if ((currentMillis - wateringStartTime) >= (waterLimitMinutes * 60000UL)) {
+          digitalWrite(RELAY_PIN, LOW);
+          sendAdafruitData("valve-status", 0);
+          wateringStartTime = 0;
+          triggerCooldown();
+          Serial.println("Max watering duration reached. Cooldown initiated.");
         }
-    </script>
-    <style>
-        body {
-            background-color: #f8fafc;
-            background-image: 
-                radial-gradient(at 10% 10%, rgba(16, 185, 129, 0.06) 0px, transparent 50%),
-                radial-gradient(at 90% 90%, rgba(5, 150, 105, 0.04) 0px, transparent 50%);
+      } else {
+        if (wateringStartTime != 0) {
+          digitalWrite(RELAY_PIN, LOW);
+          sendAdafruitData("valve-status", 0);
+          wateringStartTime = 0;
+          triggerCooldown();
+          Serial.println("Soil optimal. Watering completed, cooldown initiated.");
         }
-        .light-panel {
-            background: rgba(255, 255, 255, 0.85);
-            backdrop-filter: blur(12px);
-            border: 1px solid rgba(16, 185, 129, 0.2);
-            box-shadow: 0 4px 6px -1px rgba(0, 0, 0, 0.05), 0 2px 4px -1px rgba(0, 0, 0, 0.03);
-        }
-        .light-panel-glow {
-            background: rgba(255, 255, 255, 0.95);
-            backdrop-filter: blur(12px);
-            border: 1px solid rgba(16, 185, 129, 0.35);
-            box-shadow: 0 0 25px -5px rgba(16, 185, 129, 0.15);
-        }
-        /* Circular Gauge Styles */
-        .gauge-bg {
-            stroke: #e2e8f0;
-        }
-        .gauge-progress {
-            stroke-dasharray: 283;
-            stroke-dashoffset: 140;
-            transition: stroke-dashoffset 0.8s ease, stroke 0.5s ease;
-        }
-    </style>
-</head>
-<body class="text-slate-800 min-h-screen flex flex-col font-sans antialiased selection:bg-emerald-500 selection:text-white">
-
-    <!-- TOP HEADER -->
-    <header class="sticky top-0 z-50 light-panel border-b border-emerald-900/10 px-4 py-3 sm:px-8">
-        <div class="max-w-7xl mx-auto flex flex-wrap items-center justify-between gap-4">
-            
-            <!-- Brand Title -->
-            <div class="flex items-center gap-3">
-                <div class="w-10 h-10 rounded-xl bg-gradient-to-br from-emerald-500 to-forest-700 flex items-center justify-center text-white font-bold text-xl shadow-lg shadow-emerald-500/30">
-                    <i class="fa-solid font-black fa-leaf"></i>
-                </div>
-                <div>
-                    <h1 class="text-lg font-bold tracking-wide text-slate-900 flex items-center gap-2">
-                        Smart Irrigation <span class="text-xs bg-emerald-100 text-emerald-800 border border-emerald-300 px-2 py-0.5 rounded-full uppercase tracking-wider font-bold">PRO</span>
-                    </h1>
-                    <p class="text-xs text-slate-500">Capacitive Sensor • 230V Relay • ESP32</p>
-                </div>
-            </div>
-
-            <!-- Status Quick Bar with Colorful Indicators -->
-            <div class="flex items-center gap-3 text-xs">
-                <!-- System Operational Badge -->
-                <div id="sys-status-badge" class="px-3 py-1.5 rounded-lg bg-emerald-50 border border-emerald-300 text-emerald-800 flex items-center gap-2 font-semibold shadow-sm">
-                    <span id="sys-status-dot" class="w-2.5 h-2.5 rounded-full bg-emerald-500 animate-pulse"></span>
-                    <span id="sys-status-text">SYSTEM IDLE</span>
-                </div>
-
-                <!-- Wi-Fi Status Badge -->
-                <div id="wifi-status-badge" class="px-3 py-1.5 rounded-lg bg-sky-50 border border-sky-300 text-sky-800 flex items-center gap-2 font-semibold shadow-sm">
-                    <i class="fa-solid fa-wifi text-sky-600"></i>
-                    <span id="wifi-status-text">Connected (-62 dBm)</span>
-                </div>
-
-                <!-- Settings Trigger Button -->
-                <button onclick="switchTab('settings')" class="p-2 rounded-lg bg-slate-100 hover:bg-slate-200 text-slate-700 border border-slate-300 transition shadow-sm">
-                    <i class="fa-solid fa-gear"></i>
-                </button>
-            </div>
-        </div>
-    </header>
-
-    <!-- FAULT ALERT BANNER -->
-    <div id="fault-banner" class="hidden bg-rose-500 text-white border-b border-rose-600 px-4 py-2.5 text-xs sm:text-sm font-semibold shadow-md">
-        <div class="max-w-7xl mx-auto flex items-center justify-between gap-3">
-            <div class="flex items-center gap-2">
-                <i class="fa-solid fa-circle-exclamation text-xl animate-bounce"></i>
-                <span><strong>HARDWARE FAULT DETECTED:</strong> <span id="fault-banner-text">Soil Moisture Sensor reading out of valid range (ADC > 3800). Safety interlock engaged.</span></span>
-            </div>
-            <button onclick="dismissFaultAlert()" class="px-2.5 py-1 bg-white/20 hover:bg-white/30 text-white rounded-md text-xs transition">Dismiss</button>
-        </div>
-    </div>
-
-    <!-- MAIN DASHBOARD CONTENT CONTAINER -->
-    <main class="flex-1 max-w-7xl w-full mx-auto p-4 sm:p-6 lg:p-8 space-y-6">
-
-        <!-- TAB NAVIGATION BAR -->
-        <nav class="flex space-x-1 sm:space-x-2 bg-slate-200/70 p-1.5 rounded-xl border border-slate-300/80 text-xs sm:text-sm font-semibold overflow-x-auto shadow-sm">
-            <button id="tab-btn-overview" onclick="switchTab('overview')" class="flex-1 py-2.5 px-3 rounded-lg text-white bg-emerald-600 font-bold transition flex items-center justify-center gap-2 shadow-md whitespace-nowrap">
-                <i class="fa-solid fa-gauge-high"></i> Overview & Control
-            </button>
-            <button id="tab-btn-timers" onclick="switchTab('timers')" class="flex-1 py-2.5 px-3 rounded-lg text-slate-700 hover:text-slate-900 hover:bg-white/60 transition flex items-center justify-center gap-2 whitespace-nowrap">
-                <i class="fa-solid fa-clock font-bold"></i> Timers & Limits
-            </button>
-            <button id="tab-btn-diagnostics" onclick="switchTab('diagnostics')" class="flex-1 py-2.5 px-3 rounded-lg text-slate-700 hover:text-slate-900 hover:bg-white/60 transition flex items-center justify-center gap-2 whitespace-nowrap">
-                <i class="fa-solid fa-microchip"></i> Diagnostics & Health
-            </button>
-            <button id="tab-btn-logs" onclick="switchTab('logs')" class="flex-1 py-2.5 px-3 rounded-lg text-slate-700 hover:text-slate-900 hover:bg-white/60 transition flex items-center justify-center gap-2 whitespace-nowrap">
-                <i class="fa-solid fa-list-ul"></i> Activity Logs
-            </button>
-            <button id="tab-btn-settings" onclick="switchTab('settings')" class="flex-1 py-2.5 px-3 rounded-lg text-slate-700 hover:text-slate-900 hover:bg-white/60 transition flex items-center justify-center gap-2 whitespace-nowrap">
-                <i class="fa-solid fa-sliders"></i> Settings
-            </button>
-        </nav>
-
-        <!-- ================================================================= -->
-        <!-- TAB 1: OVERVIEW & CONTROL -->
-        <!-- ================================================================= -->
-        <div id="tab-overview" class="space-y-6">
-            
-            <!-- TOP GRID: GAUGE + VALVE STATE + PRIMARY TOGGLES -->
-            <div class="grid grid-cols-1 md:grid-cols-3 gap-6">
-
-                <!-- CARD 1: SOIL MOISTURE GAUGE -->
-                <div class="light-panel-glow rounded-2xl p-6 flex flex-col items-center justify-between text-center relative overflow-hidden">
-                    <div class="w-full flex justify-between items-center text-xs font-bold text-slate-600 mb-2">
-                        <span><i class="fa-solid fa-droplet text-sky-500 mr-1"></i> SOIL MOISTURE</span>
-                        <span id="sensor-health-pill" class="px-2 py-0.5 rounded bg-emerald-100 text-emerald-800 border border-emerald-300 font-bold">Healthy</span>
-                    </div>
-
-                    <!-- Circular Progress Visual -->
-                    <div class="relative w-48 h-48 my-2 flex items-center justify-center">
-                        <svg class="w-full h-full transform -rotate-90" viewBox="0 0 100 100">
-                            <circle class="gauge-bg" cx="50" cy="50" r="45" stroke-width="8" fill="none" />
-                            <circle id="gauge-circle" class="gauge-progress stroke-emerald-500" cx="50" cy="50" r="45" stroke-width="8" stroke-linecap="round" fill="none" />
-                        </svg>
-                        <div class="absolute flex flex-col items-center">
-                            <span id="moisture-percent" class="text-4xl font-black text-slate-900 tracking-tight">48%</span>
-                            <span id="moisture-adc" class="text-xs font-semibold text-slate-500 mt-0.5">2140 ADC</span>
-                            <span id="moisture-status-text" class="text-xs font-bold text-emerald-700 bg-emerald-100 px-2.5 py-1 rounded-full mt-2 border border-emerald-300">Optimal Moisture</span>
-                        </div>
-                    </div>
-
-                    <div class="w-full flex justify-between items-center text-xs font-medium text-slate-500 border-t border-slate-200 pt-3 mt-2">
-                        <span>Dry (&gt;2800 ADC)</span>
-                        <span>Wet (&lt;1200 ADC)</span>
-                    </div>
-                </div>
-
-                <!-- CARD 2: VALVE & RELAY REAL-TIME STATUS -->
-                <div class="light-panel rounded-2xl p-6 flex flex-col justify-between">
-                    <div>
-                        <div class="flex justify-between items-center text-xs font-bold text-slate-600 mb-4">
-                            <span><i class="fa-solid fa-bolt text-amber-500 mr-1"></i> 230V SOLENOID VALVE</span>
-                            <span class="text-slate-400 font-semibold">Relay #1</span>
-                        </div>
-
-                        <div class="flex flex-col items-center justify-center my-4 py-4 rounded-xl bg-slate-50 border border-slate-200 shadow-inner">
-                            <div id="valve-icon-container" class="w-16 h-16 rounded-full bg-slate-200 text-slate-400 flex items-center justify-center text-2xl border border-slate-300 mb-3 transition-all duration-300 shadow-sm">
-                                <i class="fa-solid fa-faucet-drip"></i>
-                            </div>
-                            <h2 id="valve-state-title" class="text-xl font-black tracking-wide text-slate-500">VALVE CLOSED</h2>
-                            <p id="valve-subtext" class="text-xs font-medium text-slate-400 mt-1">Solenoid Relay De-energized</p>
-                        </div>
-                    </div>
-
-                    <!-- Mode Info Ticker -->
-                    <div class="bg-emerald-50/70 p-3 rounded-lg border border-emerald-200 text-xs space-y-1 shadow-sm">
-                        <div class="flex justify-between text-slate-700 font-medium">
-                            <span>Active Driving Mode:</span>
-                            <strong id="active-mode-label" class="text-emerald-700 font-bold">AUTO MODE</strong>
-                        </div>
-                        <div class="flex justify-between text-slate-500">
-                            <span>Relay Interlock:</span>
-                            <span id="interlock-status" class="text-emerald-600 font-bold">CLEAR</span>
-                        </div>
-                    </div>
-                </div>
-
-                <!-- CARD 3: AUTOMATIC MODE & MANUAL OVERRIDE SWITCHES -->
-                <div class="light-panel rounded-2xl p-6 flex flex-col justify-between">
-                    <div>
-                        <div class="flex justify-between items-center text-xs font-bold text-slate-600 mb-4">
-                            <span><i class="fa-solid fa-sliders text-emerald-600 mr-1"></i> OPERATIONAL CONTROL</span>
-                            <span class="text-slate-400 font-semibold">Priority Override</span>
-                        </div>
-
-                        <!-- AUTOMATIC MODE SWITCH -->
-                        <div class="bg-emerald-50/50 p-4 rounded-xl border border-emerald-200 mb-4 flex items-center justify-between shadow-sm">
-                            <div>
-                                <h3 class="text-sm font-bold text-slate-900 flex items-center gap-2">
-                                    Automatic Mode
-                                    <span class="text-[10px] bg-emerald-600 text-white px-2 py-0.5 rounded-full font-bold shadow-sm">DEFAULT</span>
-                                </h3>
-                                <p class="text-xs text-slate-500 mt-0.5">Automated soil moisture monitoring</p>
-                            </div>
-                            <label class="relative inline-flex items-center cursor-pointer">
-                                <input type="checkbox" id="toggle-auto-mode" checked onchange="handleAutoToggle(this)" class="sr-only peer">
-                                <div class="w-11 h-6 bg-slate-300 peer-focus:outline-none rounded-full peer peer-checked:after:translate-x-full peer-checked:after:border-white after:content-[''] after:absolute after:top-[2px] after:left-[2px] after:bg-white after:border-slate-300 after:border after:rounded-full after:h-5 after:w-5 after:transition-all peer-checked:bg-emerald-600 shadow-sm"></div>
-                            </label>
-                        </div>
-
-                        <!-- MANUAL WATERING SWITCH -->
-                        <div id="manual-switch-card" class="bg-slate-100/70 p-4 rounded-xl border border-slate-200 flex items-center justify-between opacity-50 pointer-events-none transition shadow-sm">
-                            <div>
-                                <h3 class="text-sm font-bold text-slate-800">Manual Water Override</h3>
-                                <p class="text-xs text-slate-500 mt-0.5">Requires Auto Mode to be OFF</p>
-                            </div>
-                            <label class="relative inline-flex items-center cursor-pointer">
-                                <input type="checkbox" id="toggle-manual-water" onchange="handleManualToggle(this)" class="sr-only peer">
-                                <div class="w-11 h-6 bg-slate-300 peer-focus:outline-none rounded-full peer peer-checked:after:translate-x-full peer-checked:after:border-white after:content-[''] after:absolute after:top-[2px] after:left-[2px] after:bg-white after:border-slate-300 after:border after:rounded-full after:h-5 after:w-5 after:transition-all peer-checked:bg-emerald-600 shadow-sm"></div>
-                            </label>
-                        </div>
-                    </div>
-
-                    <!-- Quick Info Note -->
-                    <p class="text-[11px] text-slate-400 mt-4 italic text-center font-medium">
-                        * Cooldown lockouts and auto-reversion fully enforced.
-                    </p>
-                </div>
-
-            </div>
-
-            <!-- MIDDLE GRID: COUNTDOWNS & EMERGENCY STOP PANEL -->
-            <div class="grid grid-cols-1 md:grid-cols-3 gap-6">
-
-                <!-- COUNTDOWN 1: REMAINING WATER TIME -->
-                <div class="light-panel rounded-2xl p-5 flex items-center justify-between shadow-sm">
-                    <div class="space-y-1">
-                        <span class="text-xs font-bold text-slate-600 uppercase tracking-wider block">
-                            <i class="fa-solid fa-hourglass-half mr-1 text-sky-600"></i> Water Time Remaining
-                        </span>
-                        <div id="water-timer-display" class="text-3xl font-black text-slate-900 tracking-tight">00:00</div>
-                        <span class="text-xs text-slate-500 font-medium block">Limit Set: <span id="limit-water-display" class="font-bold text-slate-700">01:00</span> min</span>
-                    </div>
-                    <div class="w-12 h-12 rounded-xl bg-sky-50 border border-sky-200 flex items-center justify-center text-sky-600 text-xl shadow-sm">
-                        <i class="fa-solid fa-droplet"></i>
-                    </div>
-                </div>
-
-                <!-- COUNTDOWN 2: COOLDOWN REMAINING -->
-                <div class="light-panel rounded-2xl p-5 flex items-center justify-between shadow-sm">
-                    <div class="space-y-1">
-                        <span class="text-xs font-bold text-slate-600 uppercase tracking-wider block">
-                            <i class="fa-solid fa-stopwatch mr-1 text-amber-600"></i> Cooldown Remaining
-                        </span>
-                        <div id="cooldown-timer-display" class="text-3xl font-black text-amber-600 tracking-tight">00:00:00</div>
-                        <span class="text-xs text-slate-500 font-medium block">Rest Interval: <span id="limit-cooldown-display" class="font-bold text-slate-700">03:00</span> hrs</span>
-                    </div>
-                    <button onclick="resetCooldownTimer()" title="Reset Active Cooldown" class="w-12 h-12 rounded-xl bg-amber-50 hover:bg-amber-100 border border-amber-300 flex items-center justify-center text-amber-700 text-lg transition shadow-sm">
-                        <i class="fa-solid fa-rotate-left"></i>
-                    </button>
-                </div>
-
-                <!-- EMERGENCY STOP ACTIONS -->
-                <div class="light-panel rounded-2xl p-5 flex flex-col justify-between bg-gradient-to-br from-rose-50 to-white border-rose-200 shadow-sm">
-                    <div class="flex justify-between items-center mb-2">
-                        <span class="text-xs font-bold text-rose-700 uppercase tracking-wider">
-                            <i class="fa-solid fa-shield-halved mr-1"></i> Safety Interlock
-                        </span>
-                        <span id="estop-status-badge" class="text-[10px] bg-emerald-100 text-emerald-800 border border-emerald-300 px-2 py-0.5 rounded-full font-bold">NORMAL</span>
-                    </div>
-
-                    <div class="grid grid-cols-2 gap-3 my-1">
-                        <button onclick="triggerEmergencyStop()" class="py-2.5 px-3 rounded-xl bg-rose-600 hover:bg-rose-700 text-white font-black text-xs sm:text-sm tracking-wide shadow-md shadow-rose-600/30 border border-rose-500 transition flex items-center justify-center gap-1.5">
-                            <i class="fa-solid fa-triangle-exclamation"></i> E-STOP
-                        </button>
-                        <button onclick="resetEmergencyStop()" class="py-2.5 px-3 rounded-xl bg-slate-200 hover:bg-slate-300 text-slate-800 font-bold text-xs sm:text-sm border border-slate-300 transition flex items-center justify-center gap-1.5 shadow-sm">
-                            <i class="fa-solid fa-check-double"></i> RESET
-                        </button>
-                    </div>
-
-                    <p class="text-[10px] text-rose-700/80 text-center font-medium">E-STOP instantly cuts 230V relay power.</p>
-                </div>
-
-            </div>
-
-            <!-- BOTTOM TICKER: LATEST EVENT -->
-            <div class="light-panel rounded-xl p-3 px-4 flex items-center justify-between text-xs text-slate-700 shadow-sm">
-                <div class="flex items-center gap-2 overflow-hidden">
-                    <span class="font-bold text-white bg-emerald-600 uppercase tracking-wider text-[11px] px-2.5 py-1 rounded-md shadow-sm whitespace-nowrap">Latest Event</span>
-                    <span id="latest-event-text" class="truncate font-medium text-slate-600">System connected. Soil moisture verified optimal.</span>
-                </div>
-                <button onclick="switchTab('logs')" class="text-emerald-700 hover:underline whitespace-nowrap ml-3 font-bold">View All</button>
-            </div>
-
-        </div>
-
-        <!-- ================================================================= -->
-        <!-- TAB 2: TIMERS & LIMITS -->
-        <!-- ================================================================= -->
-        <div id="tab-timers" class="hidden space-y-6">
-            <div class="light-panel rounded-2xl p-6 space-y-6 shadow-sm">
-                <div>
-                    <h2 class="text-lg font-bold text-slate-900 flex items-center gap-2">
-                        <i class="fa-solid fa-stopwatch text-emerald-600"></i> Irrigation Timers & Safety Limits
-                    </h2>
-                    <p class="text-xs text-slate-500 mt-1">Configure continuous watering limits and post-watering rest durations to protect soil and solenoid hardware.</p>
-                </div>
-
-                <div class="grid grid-cols-1 md:grid-cols-2 gap-6 pt-2">
-                    
-                    <!-- WATERING DURATION INPUT -->
-                    <div class="bg-slate-50 p-5 rounded-xl border border-slate-200 space-y-4 shadow-sm">
-                        <div class="flex justify-between items-start">
-                            <div>
-                                <h3 class="text-sm font-bold text-slate-900">Maximum Watering Duration</h3>
-                                <p class="text-xs text-slate-500 mt-0.5">Maximum continuous time 230V relay stays energized.</p>
-                            </div>
-                            <span class="text-xs bg-emerald-100 text-emerald-800 border border-emerald-300 px-2 py-0.5 rounded font-mono font-bold">1 - 60 min</span>
-                        </div>
-
-                        <div class="flex items-center gap-3">
-                            <input type="number" id="input-water-duration" min="1" max="60" value="1" class="bg-white border border-slate-300 rounded-lg px-4 py-2 text-slate-900 font-bold text-lg w-32 focus:outline-none focus:border-emerald-500 shadow-sm">
-                            <span class="text-sm font-bold text-slate-700">Minutes</span>
-                            <button onclick="saveWaterDuration()" class="ml-auto px-4 py-2 bg-emerald-600 hover:bg-emerald-700 text-white font-bold text-xs rounded-lg transition shadow-sm">
-                                Save Limit
-                            </button>
-                        </div>
-                    </div>
-
-                    <!-- COOLDOWN DURATION INPUT -->
-                    <div class="bg-slate-50 p-5 rounded-xl border border-slate-200 space-y-4 shadow-sm">
-                        <div class="flex justify-between items-start">
-                            <div>
-                                <h3 class="text-sm font-bold text-slate-900">Cooldown Interval Duration</h3>
-                                <p class="text-xs text-slate-500 mt-0.5">Required rest period before next auto watering session.</p>
-                            </div>
-                            <span class="text-xs bg-emerald-100 text-emerald-800 border border-emerald-300 px-2 py-0.5 rounded font-mono font-bold">0.5 - 24 hrs</span>
-                        </div>
-
-                        <div class="flex items-center gap-3">
-                            <input type="number" id="input-cooldown-duration" min="0.5" max="24" step="0.5" value="3" class="bg-white border border-slate-300 rounded-lg px-4 py-2 text-slate-900 font-bold text-lg w-32 focus:outline-none focus:border-emerald-500 shadow-sm">
-                            <span class="text-sm font-bold text-slate-700">Hours</span>
-                            <button onclick="saveCooldownDuration()" class="ml-auto px-4 py-2 bg-emerald-600 hover:bg-emerald-700 text-white font-bold text-xs rounded-lg transition shadow-sm">
-                                Save Interval
-                            </button>
-                        </div>
-                    </div>
-
-                </div>
-
-                <!-- RESET COOLDOWN ACTION CARD -->
-                <div class="bg-amber-50/60 p-4 rounded-xl border border-amber-200 flex items-center justify-between shadow-sm">
-                    <div>
-                        <h4 class="text-xs font-bold text-amber-900">Active Cooldown Manual Override</h4>
-                        <p class="text-xs text-amber-700/80">Instantly clear any active post-irrigation lockout period.</p>
-                    </div>
-                    <button onclick="resetCooldownTimer()" class="px-4 py-2 bg-amber-600 hover:bg-amber-700 text-white rounded-lg text-xs font-bold transition flex items-center gap-2 shadow-sm">
-                        <i class="fa-solid fa-rotate-left"></i> Reset Cooldown Lockout
-                    </button>
-                </div>
-            </div>
-        </div>
-
-        <!-- ================================================================= -->
-        <!-- TAB 3: DIAGNOSTICS & HEALTH -->
-        <!-- ================================================================= -->
-        <div id="tab-diagnostics" class="hidden space-y-6">
-            <div class="grid grid-cols-1 md:grid-cols-2 gap-6">
-
-                <!-- HARDWARE SENSOR HEALTH CARD -->
-                <div class="light-panel rounded-2xl p-6 space-y-4 shadow-sm">
-                    <h2 class="text-base font-bold text-slate-900 flex items-center gap-2">
-                        <i class="fa-solid fa-vial text-emerald-600"></i> Capacitive Soil Sensor Health
-                    </h2>
-
-                    <div class="space-y-3 text-xs">
-                        <div class="flex justify-between p-3 bg-slate-50 rounded-lg border border-slate-200 shadow-sm">
-                            <span class="text-slate-500 font-medium">Raw Analog Reading (ADC):</span>
-                            <strong class="text-slate-900 font-mono font-bold" id="diag-adc-val">2140 ADC</strong>
-                        </div>
-                        <div class="flex justify-between p-3 bg-slate-50 rounded-lg border border-slate-200 shadow-sm">
-                            <span class="text-slate-500 font-medium">Valid Hardware Bounds:</span>
-                            <span class="text-emerald-700 font-mono font-bold">200 ADC - 3800 ADC</span>
-                        </div>
-                        <div class="flex justify-between p-3 bg-slate-50 rounded-lg border border-slate-200 shadow-sm">
-                            <span class="text-slate-500 font-medium">Sensor Line Integrity:</span>
-                            <span id="diag-sensor-status" class="text-emerald-600 font-bold bg-emerald-50 px-2 py-0.5 rounded border border-emerald-200">NORMAL (Connected)</span>
-                        </div>
-                    </div>
-                </div>
-
-                <!-- WI-FI & AP SETUP MODE CARD -->
-                <div class="light-panel rounded-2xl p-6 space-y-4 shadow-sm">
-                    <h2 class="text-base font-bold text-slate-900 flex items-center gap-2">
-                        <i class="fa-solid fa-wifi text-sky-600"></i> Wi-Fi & Hotspot Provisioning
-                    </h2>
-
-                    <div class="space-y-3 text-xs">
-                        <div class="flex justify-between p-3 bg-slate-50 rounded-lg border border-slate-200 shadow-sm">
-                            <span class="text-slate-500 font-medium">Current Network (SSID):</span>
-                            <strong class="text-slate-900 font-mono font-bold">HomeWiFi_Plus</strong>
-                        </div>
-                        <div class="flex justify-between p-3 bg-slate-50 rounded-lg border border-slate-200 shadow-sm">
-                            <span class="text-slate-500 font-medium">Hotspot Fallback Rule:</span>
-                            <span class="text-sky-700 font-bold">Triggers if no Wi-Fi &gt; 30s</span>
-                        </div>
-                    </div>
-
-                    <!-- TRIGGER AP MODE BUTTON -->
-                    <button onclick="triggerWifiAPMode()" class="w-full py-2.5 bg-sky-600 hover:bg-sky-700 text-white rounded-xl text-xs font-bold transition flex items-center justify-center gap-2 shadow-sm">
-                        <i class="fa-solid fa-tower-cell"></i> Force ESP32 Wi-Fi Setup Mode (AP Hotspot)
-                    </button>
-                </div>
-
-            </div>
-        </div>
-
-        <!-- ================================================================= -->
-        <!-- TAB 4: ACTIVITY LOGS -->
-        <!-- ================================================================= -->
-        <div id="tab-logs" class="hidden space-y-6">
-            <div class="light-panel rounded-2xl p-6 space-y-4 shadow-sm">
-                <div class="flex justify-between items-center">
-                    <h2 class="text-base font-bold text-slate-900 flex items-center gap-2">
-                        <i class="fa-solid fa-list-ul text-emerald-600"></i> System Event Ticker & History
-                    </h2>
-                    <button onclick="clearEventLogs()" class="text-xs text-slate-500 hover:text-slate-800 font-bold">Clear Logs</button>
-                </div>
-
-                <div id="log-container" class="space-y-2 max-h-96 overflow-y-auto pr-2 font-mono text-xs">
-                    <!-- Dynamic logs inserted here -->
-                </div>
-            </div>
-        </div>
-
-        <!-- ================================================================= -->
-        <!-- TAB 5: SETTINGS & ADAFRUIT IO API KEY -->
-        <!-- ================================================================= -->
-        <div id="tab-settings" class="hidden space-y-6">
-            <div class="light-panel rounded-2xl p-6 max-w-2xl mx-auto space-y-6 shadow-sm">
-                <div>
-                    <h2 class="text-lg font-bold text-slate-900 flex items-center gap-2">
-                        <i class="fa-solid fa-cloud text-emerald-600"></i> Adafruit IO Cloud Sync Settings
-                    </h2>
-                    <p class="text-xs text-slate-500 mt-1">Configure your Adafruit IO username and secret key to sync your live ESP32 dashboard over MQTT/HTTP.</p>
-                </div>
-
-                <div class="space-y-4 text-xs">
-                    <div>
-                        <label class="block font-bold text-slate-700 mb-1">Adafruit IO Username</label>
-                        <input type="text" id="setting-aio-username" placeholder="e.g. Rohan-J03" class="w-full bg-slate-50 border border-slate-300 rounded-lg px-4 py-2.5 text-slate-900 focus:outline-none focus:border-emerald-500 font-mono shadow-sm">
-                    </div>
-
-                    <div>
-                        <label class="block font-bold text-slate-700 mb-1">Adafruit IO Active Key (AIO Key)</label>
-                        <input type="password" id="setting-aio-key" placeholder="aio_..." class="w-full bg-slate-50 border border-slate-300 rounded-lg px-4 py-2.5 text-slate-900 focus:outline-none focus:border-emerald-500 font-mono shadow-sm">
-                    </div>
-
-                    <div class="pt-2 flex justify-end">
-                        <button onclick="saveSettings()" class="px-6 py-2.5 bg-emerald-600 hover:bg-emerald-700 text-white font-bold text-xs rounded-xl shadow-md transition">
-                            Save Cloud Credentials
-                        </button>
-                    </div>
-                </div>
-            </div>
-        </div>
-
-    </main>
-
-    <!-- FOOTER -->
-    <footer class="light-panel border-t border-slate-200 py-4 px-6 text-center text-xs text-slate-500 mt-auto font-medium">
-        Smart Irrigation Pro • Self-Managed Cloud Architecture • ESP32 & Adafruit IO
-    </footer>
-
-    <!-- INTERACTIVE DASHBOARD CONTROLLER SCRIPT -->
-    <script>
-        // System State
-        let autoMode = true;
-        let manualWater = false;
-        let emergencyStop = false;
-        let sensorFault = false;
-
-        // Settings & Limits (Default water limit fixed to 1 minute)
-        let waterLimitMinutes = 1;
-        let cooldownLimitHours = 3;
-
-        // Timers
-        let waterSecondsRemaining = 0;
-        let cooldownSecondsRemaining = 0;
-        let waterTimerInterval = null;
-        let cooldownTimerInterval = null;
-
-        // TAB SWITCHING LOGIC
-        function switchTab(tabName) {
-            const tabs = ['overview', 'timers', 'diagnostics', 'logs', 'settings'];
-            tabs.forEach(t => {
-                document.getElementById(`tab-${t}`).classList.add('hidden');
-                const btn = document.getElementById(`tab-btn-${t}`);
-                btn.className = "flex-1 py-2.5 px-3 rounded-lg text-slate-700 hover:text-slate-900 hover:bg-white/60 transition flex items-center justify-center gap-2 whitespace-nowrap";
-            });
-
-            document.getElementById(`tab-${tabName}`).classList.remove('hidden');
-            const activeBtn = document.getElementById(`tab-btn-${tabName}`);
-            activeBtn.className = "flex-1 py-2.5 px-3 rounded-lg text-white bg-emerald-600 font-bold transition flex items-center justify-center gap-2 shadow-md whitespace-nowrap";
-        }
-
-        // AUTO MODE TOGGLE SWITCH
-        function handleAutoToggle(checkbox) {
-            autoMode = checkbox.checked;
-            const manualCard = document.getElementById('manual-switch-card');
-            const activeModeLabel = document.getElementById('active-mode-label');
-
-            if (autoMode) {
-                manualCard.classList.add('opacity-50', 'pointer-events-none');
-                activeModeLabel.innerText = "AUTO MODE";
-                activeModeLabel.className = "text-emerald-700 font-bold";
-                document.getElementById('toggle-manual-water').checked = false;
-                manualWater = false;
-                addLogEntry("Automatic Mode Enabled.");
-            } else {
-                if (cooldownSecondsRemaining > 0) {
-                    manualCard.classList.add('opacity-50', 'pointer-events-none');
-                    addLogEntry("Auto Mode Disabled, but Manual Override locked due to ACTIVE COOLDOWN.");
-                } else {
-                    manualCard.classList.remove('opacity-50', 'pointer-events-none');
-                }
-                activeModeLabel.innerText = "MANUAL MODE";
-                activeModeLabel.className = "text-amber-600 font-bold";
-                addLogEntry("Automatic Mode Disabled.");
-            }
-            updateValveState();
-        }
-
-        // MANUAL WATER TOGGLE SWITCH
-        function handleManualToggle(checkbox) {
-            if (cooldownSecondsRemaining > 0) {
-                checkbox.checked = false;
-                manualWater = false;
-                alert("MANUAL OVERRIDE BLOCKED: Cooldown period is currently active! Please wait or reset the cooldown first.");
-                addLogEntry("⚠️ Manual water attempt blocked by Cooldown Lockout.");
-                return;
-            }
-
-            manualWater = checkbox.checked;
-
-            if (manualWater) {
-                addLogEntry("Manual Water Command Triggered.");
-                startWateringCycle();
-            } else {
-                addLogEntry("Manual Water Turned Off. Reverting to Auto & starting Cooldown.");
-                stopWateringCycle();
-                revertToAutoMode();
-                startCooldownCycle();
-            }
-            updateValveState();
-        }
-
-        // REVERT SYSTEM TO AUTO MODE & LOCK MANUAL CONTROLS
-        function revertToAutoMode() {
-            autoMode = true;
-            const autoCheckbox = document.getElementById('toggle-auto-mode');
-            if (autoCheckbox) autoCheckbox.checked = true;
-
-            const manualCard = document.getElementById('manual-switch-card');
-            const activeModeLabel = document.getElementById('active-mode-label');
-            
-            if (manualCard) manualCard.classList.add('opacity-50', 'pointer-events-none');
-            if (activeModeLabel) {
-                activeModeLabel.innerText = "AUTO MODE";
-                activeModeLabel.className = "text-emerald-700 font-bold";
-            }
-            
-            addLogEntry("System automatically reverted to Automatic Mode.");
-        }
-
-        // UPDATE VALVE STATE & UI WITH VIBRANT COLOR INDICATORS
-        function updateValveState() {
-            const iconContainer = document.getElementById('valve-icon-container');
-            const stateTitle = document.getElementById('valve-state-title');
-            const subtext = document.getElementById('valve-subtext');
-            const sysStatusText = document.getElementById('sys-status-text');
-            const sysStatusBadge = document.getElementById('sys-status-badge');
-            const sysStatusDot = document.getElementById('sys-status-dot');
-
-            if (emergencyStop) {
-                stateTitle.innerText = "VALVE LOCKED OFF";
-                stateTitle.className = "text-xl font-black tracking-wide text-rose-600";
-                subtext.innerText = "Emergency Stop Active";
-                iconContainer.className = "w-16 h-16 rounded-full bg-rose-100 text-rose-600 flex items-center justify-center text-2xl border border-rose-300 mb-3 shadow-sm";
-                sysStatusText.innerText = "EMERGENCY STOP";
-                sysStatusBadge.className = "px-3 py-1.5 rounded-lg bg-rose-100 border border-rose-300 text-rose-800 flex items-center gap-2 font-semibold shadow-sm";
-                sysStatusDot.className = "w-2.5 h-2.5 rounded-full bg-rose-600 animate-ping";
-                return;
-            }
-
-            if (manualWater || (autoMode && waterSecondsRemaining > 0)) {
-                stateTitle.innerText = "VALVE OPEN (230V ON)";
-                stateTitle.className = "text-xl font-black tracking-wide text-emerald-600";
-                subtext.innerText = "Solenoid Relay Energized";
-                iconContainer.className = "w-16 h-16 rounded-full bg-emerald-500 text-white flex items-center justify-center text-2xl border border-emerald-400 mb-3 shadow-lg shadow-emerald-500/40 animate-pulse";
-                sysStatusText.innerText = "WATERING ACTIVE";
-                sysStatusBadge.className = "px-3 py-1.5 rounded-lg bg-emerald-100 border border-emerald-300 text-emerald-800 flex items-center gap-2 font-semibold shadow-sm";
-                sysStatusDot.className = "w-2.5 h-2.5 rounded-full bg-emerald-600 animate-pulse";
-            } else {
-                stateTitle.innerText = "VALVE CLOSED";
-                stateTitle.className = "text-xl font-black tracking-wide text-slate-500";
-                subtext.innerText = "Solenoid Relay De-energized";
-                iconContainer.className = "w-16 h-16 rounded-full bg-slate-200 text-slate-400 flex items-center justify-center text-2xl border border-slate-300 mb-3 shadow-sm";
-                
-                if (cooldownSecondsRemaining > 0) {
-                    sysStatusText.innerText = "COOLDOWN LOCKOUT";
-                    sysStatusBadge.className = "px-3 py-1.5 rounded-lg bg-amber-100 border border-amber-300 text-amber-800 flex items-center gap-2 font-semibold shadow-sm";
-                    sysStatusDot.className = "w-2.5 h-2.5 rounded-full bg-amber-500";
-                } else {
-                    sysStatusText.innerText = "SYSTEM IDLE";
-                    sysStatusBadge.className = "px-3 py-1.5 rounded-lg bg-emerald-50 border border-emerald-300 text-emerald-800 flex items-center gap-2 font-semibold shadow-sm";
-                    sysStatusDot.className = "w-2.5 h-2.5 rounded-full bg-emerald-500";
-                }
-            }
-        }
-
-        // WATERING TIMER CONTROLLER
-        function startWateringCycle() {
-            waterSecondsRemaining = waterLimitMinutes * 60;
-            updateTimerDisplays();
-
-            if (waterTimerInterval) clearInterval(waterTimerInterval);
-            waterTimerInterval = setInterval(() => {
-                if (waterSecondsRemaining > 0) {
-                    waterSecondsRemaining--;
-                    updateTimerDisplays();
-                } else {
-                    clearInterval(waterTimerInterval);
-                    addLogEntry("Max watering duration reached. Stopping watering.");
-                    stopWateringCycle();
-                    revertToAutoMode();
-                    startCooldownCycle();
-                }
-            }, 1000);
-        }
-
-        function stopWateringCycle() {
-            waterSecondsRemaining = 0;
-            if (waterTimerInterval) clearInterval(waterTimerInterval);
-            const manualCheckbox = document.getElementById('toggle-manual-water');
-            if (manualCheckbox) manualCheckbox.checked = false;
-            manualWater = false;
-            updateTimerDisplays();
-            updateValveState();
-        }
-
-        // COOLDOWN TIMER CONTROLLER
-        function startCooldownCycle() {
-            cooldownSecondsRemaining = cooldownLimitHours * 3600;
-            updateTimerDisplays();
-            addLogEntry(`Cooldown cycle started (${cooldownLimitHours} hours). Manual override locked.`);
-
-            const manualCard = document.getElementById('manual-switch-card');
-            if (manualCard) manualCard.classList.add('opacity-50', 'pointer-events-none');
-            updateValveState();
-
-            if (cooldownTimerInterval) clearInterval(cooldownTimerInterval);
-            cooldownTimerInterval = setInterval(() => {
-                if (cooldownSecondsRemaining > 0) {
-                    cooldownSecondsRemaining--;
-                    updateTimerDisplays();
-                } else {
-                    clearInterval(cooldownTimerInterval);
-                    addLogEntry("Cooldown period completed. System ready.");
-                    
-                    if (!autoMode) {
-                        if (manualCard) manualCard.classList.remove('opacity-50', 'pointer-events-none');
-                    }
-                    updateValveState();
-                }
-            }, 1000);
-        }
-
-        function resetCooldownTimer() {
-            cooldownSecondsRemaining = 0;
-            if (cooldownTimerInterval) clearInterval(cooldownTimerInterval);
-            updateTimerDisplays();
-            updateValveState();
-            
-            const manualCard = document.getElementById('manual-switch-card');
-            if (!autoMode && manualCard) {
-                manualCard.classList.remove('opacity-50', 'pointer-events-none');
-            }
-            
-            addLogEntry("Cooldown lockout reset manually.");
-        }
-
-        // FORMAT & DISPLAY TIMERS
-        function updateTimerDisplays() {
-            const wm = Math.floor(waterSecondsRemaining / 60);
-            const ws = waterSecondsRemaining % 60;
-            document.getElementById('water-timer-display').innerText = 
-                `${String(wm).padStart(2, '0')}:${String(ws).padStart(2, '0')}`;
-
-            const ch = Math.floor(cooldownSecondsRemaining / 3600);
-            const cm = Math.floor((cooldownSecondsRemaining % 3600) / 60);
-            const cs = cooldownSecondsRemaining % 60;
-            document.getElementById('cooldown-timer-display').innerText = 
-                `${String(ch).padStart(2, '0')}:${String(cm).padStart(2, '0')}:${String(cs).padStart(2, '0')}`;
-        }
-
-        // EMERGENCY STOP & RESET
-        function triggerEmergencyStop() {
-            emergencyStop = true;
-            stopWateringCycle();
-            document.getElementById('estop-status-badge').innerText = "LATCHED";
-            document.getElementById('estop-status-badge').className = "text-[10px] bg-rose-600 text-white px-2.5 py-0.5 rounded-full font-bold shadow-sm animate-pulse";
-            document.getElementById('interlock-status').innerText = "LATCHED OFF";
-            document.getElementById('interlock-status').className = "text-rose-600 font-bold";
-            updateValveState();
-            addLogEntry("🚨 EMERGENCY STOP TRIGGERED. 230V Relay cut off.");
-        }
-
-        function resetEmergencyStop() {
-            emergencyStop = false;
-            document.getElementById('estop-status-badge').innerText = "NORMAL";
-            document.getElementById('estop-status-badge').className = "text-[10px] bg-emerald-100 text-emerald-800 border border-emerald-300 px-2 py-0.5 rounded-full font-bold";
-            document.getElementById('interlock-status').innerText = "CLEAR";
-            document.getElementById('interlock-status').className = "text-emerald-600 font-bold";
-            updateValveState();
-            addLogEntry("Emergency Stop reset. Normal operation restored.");
-        }
-
-        // SAVE LIMIT INPUTS
-        function saveWaterDuration() {
-            const val = parseInt(document.getElementById('input-water-duration').value);
-            if (val >= 1 && val <= 60) {
-                waterLimitMinutes = val;
-                document.getElementById('limit-water-display').innerText = `${String(val).padStart(2, '0')}:00`;
-                addLogEntry(`Maximum watering duration updated to ${val} minutes.`);
-            }
-        }
-
-        function saveCooldownDuration() {
-            const val = parseFloat(document.getElementById('input-cooldown-duration').value);
-            if (val >= 0.5 && val <= 24) {
-                cooldownLimitHours = val;
-                document.getElementById('limit-cooldown-display').innerText = `${String(val).padStart(2, '0')}:00`;
-                addLogEntry(`Cooldown duration updated to ${val} hours.`);
-            }
-        }
-
-        // LOGGING SYSTEM
-        function addLogEntry(msg) {
-            const timestamp = new Date().toLocaleTimeString();
-            const logContainer = document.getElementById('log-container');
-            if (logContainer) {
-                const entry = document.createElement('div');
-                entry.className = "p-2 rounded bg-white border border-slate-200 flex justify-between items-center shadow-sm";
-                entry.innerHTML = `<span class="text-slate-800 font-medium">${msg}</span><span class="text-[10px] text-slate-400">${timestamp}</span>`;
-                logContainer.prepend(entry);
-            }
-
-            const tickerText = document.getElementById('latest-event-text');
-            if (tickerText) tickerText.innerText = `${timestamp} - ${msg}`;
-        }
-
-        function clearEventLogs() {
-            const logContainer = document.getElementById('log-container');
-            if (logContainer) logContainer.innerHTML = '';
-        }
-
-        function dismissFaultAlert() {
-            const banner = document.getElementById('fault-banner');
-            if (banner) banner.classList.add('hidden');
-        }
-
-        function triggerWifiAPMode() {
-            addLogEntry("ESP32 forced into AP Hotspot Setup Mode (192.168.4.1).");
-            alert("ESP32 is now broadasting Wi-Fi Setup AP Hotspot. Connect to 'SmartIrrigation_AP' to reconfigure network credentials.");
-        }
-
-        function saveSettings() {
-            const user = document.getElementById('setting-aio-username').value;
-            if (user) {
-                addLogEntry(`Adafruit IO credentials saved for user '${user}'.`);
-                alert("Adafruit IO credentials updated successfully!");
-            }
-        }
-
-        // INITIALIZE DEFAULT LOG
-        addLogEntry("Smart Irrigation Pro Dashboard initialized.");
-    </script>
-</body>
-</html>
+      }
+    } else if (manualWater) {
+      if ((currentMillis - wateringStartTime) >= (waterLimitMinutes * 60000UL)) {
+        digitalWrite(RELAY_PIN, LOW);
+        sendAdafruitData("valve-status", 0);
+        manualWater = false;
+        wateringStartTime = 0;
+        revertToAutoAndCooldown();
+        Serial.println("Manual max duration reached. Reverting to Auto & Cooldown.");
+      }
+    }
+  }
+
+  // Periodic Telemetry & State Save (every 10 seconds)
+  static unsigned long lastSyncTime = 0;
+  if (currentMillis - lastSyncTime > 10000) {
+    lastSyncTime = currentMillis;
+    
+    if (isCloudConnected && WiFi.status() == WL_CONNECTED) {
+      sendAdafruitData("soil-moisture", soilAdc);
+    }
+    
+    preferences.putULong("cooldownEnd", cooldownEndTime);
+    preferences.putBool("autoMode", autoMode);
+  }
+}
+
+// --- HELPER: POST DATA TO ADAFRUIT IO VIA HTTP REST ---
+void sendAdafruitData(String feedName, float value) {
+  if (!isCloudConnected || WiFi.status() != WL_CONNECTED) return;
+
+  HTTPClient http;
+  String url = "http://io.adafruit.com/api/v2/" + String(AIO_USERNAME) + "/feeds/" + feedName + "/data";
+  
+  http.begin(url);
+  http.addHeader("Content-Type", "application/json");
+  http.addHeader("X-AIO-Key", AIO_KEY);
+
+  String payload = "{\"value\":\"" + String(value) + "\"}";
+  int httpResponseCode = http.POST(payload);
+  
+  if (httpResponseCode > 0) {
+    Serial.print("Adafruit IO HTTP POST success for ");
+    Serial.print(feedName);
+    Serial.print(": ");
+    Serial.println(httpResponseCode);
+  } else {
+    Serial.print("Adafruit IO HTTP Error on ");
+    Serial.print(feedName);
+    Serial.print(": ");
+    Serial.println(httpResponseCode);
+  }
+  http.end();
+}
+
+void triggerCooldown() {
+  cooldownEndTime = millis() + (cooldownLimitHours * 3600000UL);
+  preferences.putULong("cooldownEnd", cooldownEndTime);
+}
+
+void revertToAutoAndCooldown() {
+  autoMode = true;
+  preferences.putBool("autoMode", autoMode);
+  triggerCooldown();
+}
+
+// --- LIGHT THEME LOCAL WEB SERVER UI HANDLER ---
+void handleRoot() {
+  int soilAdc = analogRead(SOIL_PIN);
+  bool isCooldownActive = (cooldownEndTime > millis());
+  bool valveOpen = digitalRead(RELAY_PIN);
+  
+  String html = "<!DOCTYPE html><html lang='en'><head><meta charset='UTF-8'>";
+  html += "<meta name='viewport' content='width=device-width, initial-scale=1'>";
+  html += "<title>Smart Irrigation Pro - Local AP</title>";
+  html += "<script src='https://cdn.tailwindcss.com'></script>";
+  html += "<link rel='stylesheet' href='https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css'>";
+  html += "</head><body class='bg-slate-100 text-slate-800 font-sans p-4 sm:p-6 flex flex-col items-center min-h-screen'>";
+  
+  html += "<div class='max-w-md w-full bg-white rounded-2xl shadow-xl border border-slate-200 overflow-hidden'>";
+  
+  html += "<div class='bg-emerald-600 text-white p-5 text-center'>";
+  html += "<div class='w-12 h-12 bg-white/20 rounded-xl mx-auto flex items-center justify-center text-2xl mb-2'><i class='fa-solid fa-leaf'></i></div>";
+  html += "<h1 class='text-xl font-bold tracking-wide'>Smart Irrigation Pro</h1>";
+  html += "<p class='text-xs text-emerald-100 mt-0.5'>Status: " + String(isCloudConnected ? "Cloud Connected" : "Secure AP Mode") + "</p>";
+  html += "</div>";
+
+  html += "<div class='p-5 space-y-4'>";
+
+  html += "<div class='grid grid-cols-2 gap-3 text-center'>";
+  html += "<div class='bg-slate-50 p-3 rounded-xl border border-slate-200'>";
+  html += "<span class='text-[10px] font-bold text-slate-400 uppercase tracking-wider block'>Soil Sensor</span>";
+  html += "<span class='text-lg font-black text-slate-800'>" + String(soilAdc) + " ADC</span>";
+  html += "</div>";
+
+  html += "<div class='bg-slate-50 p-3 rounded-xl border border-slate-200'>";
+  html += "<span class='text-[10px] font-bold text-slate-400 uppercase tracking-wider block'>Valve Status</span>";
+  if (valveOpen) {
+    html += "<span class='text-xs font-bold text-emerald-600 bg-emerald-100 px-2 py-0.5 rounded inline-block mt-1'>OPEN (ON)</span>";
+  } else {
+    html += "<span class='text-xs font-bold text-slate-500 bg-slate-200 px-2 py-0.5 rounded inline-block mt-1'>CLOSED</span>";
+  }
+  html += "</div>";
+  html += "</div>";
+
+  html += "<div class='bg-emerald-50 p-3 rounded-xl border border-emerald-200 text-xs space-y-1.5'>";
+  html += "<div class='flex justify-between font-medium'><span class='text-slate-600'>System Mode:</span><strong class='text-emerald-700'>" + String(autoMode ? "Automatic Mode" : "Manual Mode") + "</strong></div>";
+  html += "<div class='flex justify-between font-medium'><span class='text-slate-600'>Cooldown Active:</span><strong class='" + String(isCooldownActive ? "text-amber-600" : "text-emerald-700") + "'>" + String(isCooldownActive ? "YES (Locked)" : "NO (Ready)") + "</strong></div>";
+  html += "</div>";
+
+  html += "<div class='space-y-2 pt-2'>";
+  html += "<a href='/toggleAuto' class='block w-full py-2.5 px-4 bg-slate-100 hover:bg-slate-200 text-slate-700 font-bold text-xs rounded-xl text-center border border-slate-300 transition shadow-sm'><i class='fa-solid fa-sliders mr-2'></i> Toggle Auto/Manual Mode</a>";
+  html += "<a href='/toggleManual' class='block w-full py-2.5 px-4 bg-emerald-600 hover:bg-emerald-700 text-white font-bold text-xs rounded-xl text-center transition shadow-md shadow-emerald-600/30'><i class='fa-solid fa-faucet-drip mr-2'></i> Toggle Manual Water</a>";
+  html += "<a href='/resetCooldown' class='block w-full py-2.5 px-4 bg-amber-500 hover:bg-amber-600 text-white font-bold text-xs rounded-xl text-center transition shadow-sm'><i class='fa-solid fa-rotate-left mr-2'></i> Reset Cooldown Lockout</a>";
+  html += "<a href='/estop' class='block w-full py-2.5 px-4 bg-rose-600 hover:bg-rose-700 text-white font-bold text-xs rounded-xl text-center transition shadow-md shadow-rose-600/30'><i class='fa-solid fa-triangle-exclamation mr-2'></i> EMERGENCY STOP</a>";
+  html += "<a href='/resetEstop' class='block w-full py-2 px-4 bg-slate-200 hover:bg-slate-300 text-slate-700 font-bold text-xs rounded-xl text-center transition'>Reset E-Stop</a>";
+  html += "</div>";
+
+  html += "</div>";
+  html += "<div class='bg-slate-50 p-3 text-center text-[10px] text-slate-400 border-t border-slate-200'>ESP32 HTTP REST & Local Server</div>";
+  html += "</div></body></html>";
+  
+  server.send(200, "text/html", html);
+}
+
+void handleToggleAuto() {
+  autoMode = !autoMode;
+  preferences.putBool("autoMode", autoMode);
+  if (autoMode) manualWater = false;
+  server.sendHeader("Location", "/", true);
+  server.send(303);
+}
+
+void handleToggleManual() {
+  if (cooldownEndTime > millis()) {
+    server.send(400, "text/plain", "BLOCKED: Cooldown active!");
+    return;
+  }
+  if (!autoMode) {
+    manualWater = !manualWater;
+    if (manualWater) {
+      wateringStartTime = millis();
+      digitalWrite(RELAY_PIN, HIGH);
+      sendAdafruitData("valve-status", 1);
+    } else {
+      digitalWrite(RELAY_PIN, LOW);
+      sendAdafruitData("valve-status", 0);
+      wateringStartTime = 0;
+      revertToAutoAndCooldown();
+    }
+  } else {
+    server.send(400, "text/plain", "BLOCKED: Turn off Auto Mode first.");
+    return;
+  }
+  server.sendHeader("Location", "/", true);
+  server.send(303);
+}
+
+void handleEStop() {
+  emergencyStop = true;
+  digitalWrite(RELAY_PIN, LOW);
+  sendAdafruitData("valve-status", 0);
+  manualWater = false;
+  wateringStartTime = 0;
+  server.sendHeader("Location", "/", true);
+  server.send(303);
+}
+
+void handleResetEStop() {
+  emergencyStop = false;
+  server.sendHeader("Location", "/", true);
+  server.send(303);
+}
+
+void handleResetCooldown() {
+  cooldownEndTime = 0;
+  preferences.putULong("cooldownEnd", 0);
+  server.sendHeader("Location", "/", true);
+  server.send(303);
+}
