@@ -98,7 +98,7 @@
                     <span id="wifi-status-text">Connected (-62 dBm)</span>
                 </div>
 
-                <!-- Settings Modal Trigger Button -->
+                <!-- Settings Trigger Button -->
                 <button onclick="switchTab('settings')" class="p-2 rounded-lg bg-forest-800 hover:bg-forest-700 text-emerald-300 border border-emerald-700/50 transition">
                     <i class="fa-solid fa-gear"></i>
                 </button>
@@ -106,7 +106,7 @@
         </div>
     </header>
 
-    <!-- FAULT ALERT BANNER (Dynamically Shown on Error) -->
+    <!-- FAULT ALERT BANNER -->
     <div id="fault-banner" class="hidden bg-rose-950/80 border-b border-rose-500/40 px-4 py-2.5 text-rose-200 text-xs sm:text-sm font-medium">
         <div class="max-w-7xl mx-auto flex items-center justify-between gap-3">
             <div class="flex items-center gap-2">
@@ -241,7 +241,7 @@
 
                     <!-- Quick Info Note -->
                     <p class="text-[11px] text-emerald-400/50 mt-4 italic text-center">
-                        * Turning off manual mode automatically resets system to Auto Mode & triggers cooldown.
+                        * Turning off manual mode automatically reverts system to Auto Mode & triggers cooldown.
                     </p>
                 </div>
 
@@ -305,7 +305,7 @@
             <div class="glass-panel rounded-xl p-3 px-4 flex items-center justify-between text-xs text-emerald-300/80">
                 <div class="flex items-center gap-2 overflow-hidden">
                     <span class="font-bold text-emerald-400 uppercase tracking-wider text-[11px] bg-emerald-950 px-2 py-0.5 rounded border border-emerald-800/60 whitespace-nowrap">Latest Event</span>
-                    <span id="latest-event-text" class="truncate">11:45:10 - System connected. Soil moisture verified optimal at 48%.</span>
+                    <span id="latest-event-text" class="truncate">System connected. Soil moisture verified optimal.</span>
                 </div>
                 <button onclick="switchTab('logs')" class="text-emerald-400 hover:underline whitespace-nowrap ml-3 font-semibold">View All</button>
             </div>
@@ -531,7 +531,6 @@
             if (autoMode) {
                 manualCard.classList.add('opacity-50', 'pointer-events-none');
                 activeModeLabel.innerText = "AUTO MODE";
-                // Reset manual switch
                 document.getElementById('toggle-manual-water').checked = false;
                 manualWater = false;
                 addLogEntry("Automatic Mode Enabled.");
@@ -545,37 +544,37 @@
 
         // MANUAL WATER TOGGLE SWITCH
         function handleManualToggle(checkbox) {
-            if (autoMode && !manualWater) return;
-            
             manualWater = checkbox.checked;
 
             if (manualWater) {
                 addLogEntry("Manual Water Command Triggered.");
                 startWateringCycle();
             } else {
-                addLogEntry("Manual Water Stopped. Reverting to Automatic Mode.");
+                addLogEntry("Manual Water Turned Off.");
                 stopWateringCycle();
                 
-                // 1. Revert back to Auto Mode automatically
+                // 1. Force Automatic Mode back ON
                 revertToAutoMode();
 
-                // 2. Start the Cooldown Period immediately
+                // 2. Immediately start the Cooldown Period
                 startCooldownCycle();
             }
             updateValveState();
         }
 
-        // REVERT SYSTEM TO AUTO MODE
+        // REVERT SYSTEM TO AUTO MODE & LOCK MANUAL CONTROLS
         function revertToAutoMode() {
             autoMode = true;
-            document.getElementById('toggle-auto-mode').checked = true;
-            
+            const autoCheckbox = document.getElementById('toggle-auto-mode');
+            if (autoCheckbox) autoCheckbox.checked = true;
+
             const manualCard = document.getElementById('manual-switch-card');
             const activeModeLabel = document.getElementById('active-mode-label');
             
-            manualCard.classList.add('opacity-50', 'pointer-events-none');
-            activeModeLabel.innerText = "AUTO MODE";
-            addLogEntry("System automatically returned to Auto Mode.");
+            if (manualCard) manualCard.classList.add('opacity-50', 'pointer-events-none');
+            if (activeModeLabel) activeModeLabel.innerText = "AUTO MODE";
+            
+            addLogEntry("System automatically reverted to Automatic Mode.");
         }
 
         // UPDATE VALVE STATE & UI
@@ -634,7 +633,8 @@
         function stopWateringCycle() {
             waterSecondsRemaining = 0;
             if (waterTimerInterval) clearInterval(waterTimerInterval);
-            document.getElementById('toggle-manual-water').checked = false;
+            const manualCheckbox = document.getElementById('toggle-manual-water');
+            if (manualCheckbox) manualCheckbox.checked = false;
             manualWater = false;
             updateTimerDisplays();
             updateValveState();
@@ -728,20 +728,25 @@
         function addLogEntry(msg) {
             const timestamp = new Date().toLocaleTimeString();
             const logContainer = document.getElementById('log-container');
-            const entry = document.createElement('div');
-            entry.className = "p-2 rounded bg-forest-900/60 border border-emerald-900/30 flex justify-between items-center";
-            entry.innerHTML = `<span class="text-emerald-200">${msg}</span><span class="text-[10px] text-emerald-400/50">${timestamp}</span>`;
-            logContainer.prepend(entry);
+            if (logContainer) {
+                const entry = document.createElement('div');
+                entry.className = "p-2 rounded bg-forest-900/60 border border-emerald-900/30 flex justify-between items-center";
+                entry.innerHTML = `<span class="text-emerald-200">${msg}</span><span class="text-[10px] text-emerald-400/50">${timestamp}</span>`;
+                logContainer.prepend(entry);
+            }
 
-            document.getElementById('latest-event-text').innerText = `${timestamp} - ${msg}`;
+            const tickerText = document.getElementById('latest-event-text');
+            if (tickerText) tickerText.innerText = `${timestamp} - ${msg}`;
         }
 
         function clearEventLogs() {
-            document.getElementById('log-container').innerHTML = '';
+            const logContainer = document.getElementById('log-container');
+            if (logContainer) logContainer.innerHTML = '';
         }
 
         function dismissFaultAlert() {
-            document.getElementById('fault-banner').classList.add('hidden');
+            const banner = document.getElementById('fault-banner');
+            if (banner) banner.classList.add('hidden');
         }
 
         function triggerWifiAPMode() {
