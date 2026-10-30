@@ -489,319 +489,89 @@
         Smart Irrigation Pro • Self-Managed Cloud Architecture • ESP32 & Adafruit IO
     </footer>
 
-    <!-- INTERACTIVE DASHBOARD CONTROLLER SCRIPT -->
+    <!-- DASHBOARD CONTROLLER SCRIPT -->
     <script>
-        // System State
-        let autoMode = true;
-        let manualWater = false;
-        let emergencyStop = false;
-        let sensorFault = false;
-
-        // Settings & Limits (Default water limit fixed to 1 minute)
-        let waterLimitMinutes = 1;
-        let cooldownLimitHours = 3;
-
-        // Timers
-        let waterSecondsRemaining = 0;
-        let cooldownSecondsRemaining = 0;
-        let waterTimerInterval = null;
-        let cooldownTimerInterval = null;
-
-        // TAB SWITCHING LOGIC
-        function switchTab(tabName) {
-            const tabs = ['overview', 'timers', 'diagnostics', 'logs', 'settings'];
-            tabs.forEach(t => {
-                document.getElementById(`tab-${t}`).classList.add('hidden');
-                const btn = document.getElementById(`tab-btn-${t}`);
-                btn.className = "flex-1 py-2.5 px-3 rounded-lg text-slate-700 hover:text-slate-900 hover:bg-white/60 transition flex items-center justify-center gap-2 whitespace-nowrap";
+        function switchTab(tabId) {
+            ['overview', 'timers', 'diagnostics', 'logs', 'settings'].forEach(t => {
+                document.getElementById('tab-' + t).classList.add('hidden');
+                document.getElementById('tab-btn-' + t).classList.remove('text-white', 'bg-emerald-600', 'font-bold', 'shadow-md');
+                document.getElementById('tab-btn-' + t).classList.add('text-slate-700');
             });
-
-            document.getElementById(`tab-${tabName}`).classList.remove('hidden');
-            const activeBtn = document.getElementById(`tab-btn-${tabName}`);
-            activeBtn.className = "flex-1 py-2.5 px-3 rounded-lg text-white bg-emerald-600 font-bold transition flex items-center justify-center gap-2 shadow-md whitespace-nowrap";
+            document.getElementById('tab-' + tabId).classList.remove('hidden');
+            document.getElementById('tab-btn-' + tabId).classList.add('text-white', 'bg-emerald-600', 'font-bold', 'shadow-md');
+            document.getElementById('tab-btn-' + tabId).classList.remove('text-slate-700');
         }
 
-        // AUTO MODE TOGGLE SWITCH
-        function handleAutoToggle(checkbox) {
-            autoMode = checkbox.checked;
+        function handleAutoToggle(el) {
             const manualCard = document.getElementById('manual-switch-card');
-            const activeModeLabel = document.getElementById('active-mode-label');
-
-            if (autoMode) {
-                manualCard.classList.add('opacity-50', 'pointer-events-none');
-                activeModeLabel.innerText = "AUTO MODE";
-                activeModeLabel.className = "text-emerald-700 font-bold";
-                document.getElementById('toggle-manual-water').checked = false;
-                manualWater = false;
-                addLogEntry("Automatic Mode Enabled.");
-            } else {
-                if (cooldownSecondsRemaining > 0) {
-                    manualCard.classList.add('opacity-50', 'pointer-events-none');
-                    addLogEntry("Auto Mode Disabled, but Manual Override locked due to ACTIVE COOLDOWN.");
-                } else {
-                    manualCard.classList.remove('opacity-50', 'pointer-events-none');
-                }
-                activeModeLabel.innerText = "MANUAL MODE";
-                activeModeLabel.className = "text-amber-600 font-bold";
-                addLogEntry("Automatic Mode Disabled.");
-            }
-            updateValveState();
-        }
-
-        // MANUAL WATER TOGGLE SWITCH
-        function handleManualToggle(checkbox) {
-            if (cooldownSecondsRemaining > 0) {
-                checkbox.checked = false;
-                manualWater = false;
-                alert("MANUAL OVERRIDE BLOCKED: Cooldown period is currently active! Please wait or reset the cooldown first.");
-                addLogEntry("⚠️ Manual water attempt blocked by Cooldown Lockout.");
-                return;
-            }
-
-            manualWater = checkbox.checked;
-
-            if (manualWater) {
-                addLogEntry("Manual Water Command Triggered.");
-                startWateringCycle();
-            } else {
-                addLogEntry("Manual Water Turned Off. Reverting to Auto & starting Cooldown.");
-                stopWateringCycle();
-                revertToAutoMode();
-                startCooldownCycle();
-            }
-            updateValveState();
-        }
-
-        // REVERT SYSTEM TO AUTO MODE & LOCK MANUAL CONTROLS
-        function revertToAutoMode() {
-            autoMode = true;
-            const autoCheckbox = document.getElementById('toggle-auto-mode');
-            if (autoCheckbox) autoCheckbox.checked = true;
-
-            const manualCard = document.getElementById('manual-switch-card');
-            const activeModeLabel = document.getElementById('active-mode-label');
-            
-            if (manualCard) manualCard.classList.add('opacity-50', 'pointer-events-none');
-            if (activeModeLabel) {
-                activeModeLabel.innerText = "AUTO MODE";
-                activeModeLabel.className = "text-emerald-700 font-bold";
-            }
-            
-            addLogEntry("System automatically reverted to Automatic Mode.");
-        }
-
-        // UPDATE VALVE STATE & UI WITH VIBRANT COLOR INDICATORS
-        function updateValveState() {
-            const iconContainer = document.getElementById('valve-icon-container');
-            const stateTitle = document.getElementById('valve-state-title');
-            const subtext = document.getElementById('valve-subtext');
-            const sysStatusText = document.getElementById('sys-status-text');
-            const sysStatusBadge = document.getElementById('sys-status-badge');
-            const sysStatusDot = document.getElementById('sys-status-dot');
-
-            if (emergencyStop) {
-                stateTitle.innerText = "VALVE LOCKED OFF";
-                stateTitle.className = "text-xl font-black tracking-wide text-rose-600";
-                subtext.innerText = "Emergency Stop Active";
-                iconContainer.className = "w-16 h-16 rounded-full bg-rose-100 text-rose-600 flex items-center justify-center text-2xl border border-rose-300 mb-3 shadow-sm";
-                sysStatusText.innerText = "EMERGENCY STOP";
-                sysStatusBadge.className = "px-3 py-1.5 rounded-lg bg-rose-100 border border-rose-300 text-rose-800 flex items-center gap-2 font-semibold shadow-sm";
-                sysStatusDot.className = "w-2.5 h-2.5 rounded-full bg-rose-600 animate-ping";
-                return;
-            }
-
-            if (manualWater || (autoMode && waterSecondsRemaining > 0)) {
-                stateTitle.innerText = "VALVE OPEN (230V ON)";
-                stateTitle.className = "text-xl font-black tracking-wide text-emerald-600";
-                subtext.innerText = "Solenoid Relay Energized";
-                iconContainer.className = "w-16 h-16 rounded-full bg-emerald-500 text-white flex items-center justify-center text-2xl border border-emerald-400 mb-3 shadow-lg shadow-emerald-500/40 animate-pulse";
-                sysStatusText.innerText = "WATERING ACTIVE";
-                sysStatusBadge.className = "px-3 py-1.5 rounded-lg bg-emerald-100 border border-emerald-300 text-emerald-800 flex items-center gap-2 font-semibold shadow-sm";
-                sysStatusDot.className = "w-2.5 h-2.5 rounded-full bg-emerald-600 animate-pulse";
-            } else {
-                stateTitle.innerText = "VALVE CLOSED";
-                stateTitle.className = "text-xl font-black tracking-wide text-slate-500";
-                subtext.innerText = "Solenoid Relay De-energized";
-                iconContainer.className = "w-16 h-16 rounded-full bg-slate-200 text-slate-400 flex items-center justify-center text-2xl border border-slate-300 mb-3 shadow-sm";
-                
-                if (cooldownSecondsRemaining > 0) {
-                    sysStatusText.innerText = "COOLDOWN LOCKOUT";
-                    sysStatusBadge.className = "px-3 py-1.5 rounded-lg bg-amber-100 border border-amber-300 text-amber-800 flex items-center gap-2 font-semibold shadow-sm";
-                    sysStatusDot.className = "w-2.5 h-2.5 rounded-full bg-amber-500";
-                } else {
-                    sysStatusText.innerText = "SYSTEM IDLE";
-                    sysStatusBadge.className = "px-3 py-1.5 rounded-lg bg-emerald-50 border border-emerald-300 text-emerald-800 flex items-center gap-2 font-semibold shadow-sm";
-                    sysStatusDot.className = "w-2.5 h-2.5 rounded-full bg-emerald-500";
-                }
-            }
-        }
-
-        // WATERING TIMER CONTROLLER
-        function startWateringCycle() {
-            waterSecondsRemaining = waterLimitMinutes * 60;
-            updateTimerDisplays();
-
-            if (waterTimerInterval) clearInterval(waterTimerInterval);
-            waterTimerInterval = setInterval(() => {
-                if (waterSecondsRemaining > 0) {
-                    waterSecondsRemaining--;
-                    updateTimerDisplays();
-                } else {
-                    clearInterval(waterTimerInterval);
-                    addLogEntry("Max watering duration reached. Stopping watering.");
-                    stopWateringCycle();
-                    revertToAutoMode();
-                    startCooldownCycle();
-                }
-            }, 1000);
-        }
-
-        function stopWateringCycle() {
-            waterSecondsRemaining = 0;
-            if (waterTimerInterval) clearInterval(waterTimerInterval);
-            const manualCheckbox = document.getElementById('toggle-manual-water');
-            if (manualCheckbox) manualCheckbox.checked = false;
-            manualWater = false;
-            updateTimerDisplays();
-            updateValveState();
-        }
-
-        // COOLDOWN TIMER CONTROLLER
-        function startCooldownCycle() {
-            cooldownSecondsRemaining = cooldownLimitHours * 3600;
-            updateTimerDisplays();
-            addLogEntry(`Cooldown cycle started (${cooldownLimitHours} hours). Manual override locked.`);
-
-            const manualCard = document.getElementById('manual-switch-card');
-            if (manualCard) manualCard.classList.add('opacity-50', 'pointer-events-none');
-            updateValveState();
-
-            if (cooldownTimerInterval) clearInterval(cooldownTimerInterval);
-            cooldownTimerInterval = setInterval(() => {
-                if (cooldownSecondsRemaining > 0) {
-                    cooldownSecondsRemaining--;
-                    updateTimerDisplays();
-                } else {
-                    clearInterval(cooldownTimerInterval);
-                    addLogEntry("Cooldown period completed. System ready.");
-                    
-                    if (!autoMode) {
-                        if (manualCard) manualCard.classList.remove('opacity-50', 'pointer-events-none');
-                    }
-                    updateValveState();
-                }
-            }, 1000);
-        }
-
-        function resetCooldownTimer() {
-            cooldownSecondsRemaining = 0;
-            if (cooldownTimerInterval) clearInterval(cooldownTimerInterval);
-            updateTimerDisplays();
-            updateValveState();
-            
-            const manualCard = document.getElementById('manual-switch-card');
-            if (!autoMode && manualCard) {
+            if (!el.checked) {
                 manualCard.classList.remove('opacity-50', 'pointer-events-none');
+                document.getElementById('active-mode-label').innerText = "MANUAL OVERRIDE";
+            } else {
+                manualCard.classList.add('opacity-50', 'pointer-events-none');
+                document.getElementById('toggle-manual-water').checked = false;
+                document.getElementById('active-mode-label').innerText = "AUTO MODE";
             }
-            
-            addLogEntry("Cooldown lockout reset manually.");
         }
 
-        // FORMAT & DISPLAY TIMERS
-        function updateTimerDisplays() {
-            const wm = Math.floor(waterSecondsRemaining / 60);
-            const ws = waterSecondsRemaining % 60;
-            document.getElementById('water-timer-display').innerText = 
-                `${String(wm).padStart(2, '0')}:${String(ws).padStart(2, '0')}`;
-
-            const ch = Math.floor(cooldownSecondsRemaining / 3600);
-            const cm = Math.floor((cooldownSecondsRemaining % 3600) / 60);
-            const cs = cooldownSecondsRemaining % 60;
-            document.getElementById('cooldown-timer-display').innerText = 
-                `${String(ch).padStart(2, '0')}:${String(cm).padStart(2, '0')}:${String(cs).padStart(2, '0')}`;
+        function handleManualToggle(el) {
+            const badge = document.getElementById('valve-state-title');
+            const icon = document.getElementById('valve-icon-container');
+            if (el.checked) {
+                badge.innerText = "VALVE OPEN (MANUAL)";
+                badge.className = "text-xl font-black tracking-wide text-emerald-600";
+                icon.className = "w-16 h-16 rounded-full bg-emerald-100 text-emerald-600 flex items-center justify-center text-2xl border border-emerald-300 mb-3 transition-all duration-300 shadow-sm";
+            } else {
+                badge.innerText = "VALVE CLOSED";
+                badge.className = "text-xl font-black tracking-wide text-slate-500";
+                icon.className = "w-16 h-16 rounded-full bg-slate-200 text-slate-400 flex items-center justify-center text-2xl border border-slate-300 mb-3 transition-all duration-300 shadow-sm";
+            }
         }
 
-        // EMERGENCY STOP & RESET
         function triggerEmergencyStop() {
-            emergencyStop = true;
-            stopWateringCycle();
-            document.getElementById('estop-status-badge').innerText = "LATCHED";
-            document.getElementById('estop-status-badge').className = "text-[10px] bg-rose-600 text-white px-2.5 py-0.5 rounded-full font-bold shadow-sm animate-pulse";
-            document.getElementById('interlock-status').innerText = "LATCHED OFF";
-            document.getElementById('interlock-status').className = "text-rose-600 font-bold";
-            updateValveState();
-            addLogEntry("🚨 EMERGENCY STOP TRIGGERED. 230V Relay cut off.");
+            document.getElementById('estop-status-badge').innerText = "E-STOP ENGAGED";
+            document.getElementById('estop-status-badge').className = "text-[10px] bg-rose-100 text-rose-800 border border-rose-300 px-2 py-0.5 rounded-full font-bold animate-pulse";
+            document.getElementById('fault-banner').classList.remove('hidden');
+            document.getElementById('fault-banner-text').innerText = "Emergency Stop triggered manually. 230V Relay forcefully cut.";
         }
 
         function resetEmergencyStop() {
-            emergencyStop = false;
             document.getElementById('estop-status-badge').innerText = "NORMAL";
             document.getElementById('estop-status-badge').className = "text-[10px] bg-emerald-100 text-emerald-800 border border-emerald-300 px-2 py-0.5 rounded-full font-bold";
-            document.getElementById('interlock-status').innerText = "CLEAR";
-            document.getElementById('interlock-status').className = "text-emerald-600 font-bold";
-            updateValveState();
-            addLogEntry("Emergency Stop reset. Normal operation restored.");
-        }
-
-        // SAVE LIMIT INPUTS
-        function saveWaterDuration() {
-            const val = parseInt(document.getElementById('input-water-duration').value);
-            if (val >= 1 && val <= 60) {
-                waterLimitMinutes = val;
-                document.getElementById('limit-water-display').innerText = `${String(val).padStart(2, '0')}:00`;
-                addLogEntry(`Maximum watering duration updated to ${val} minutes.`);
-            }
-        }
-
-        function saveCooldownDuration() {
-            const val = parseFloat(document.getElementById('input-cooldown-duration').value);
-            if (val >= 0.5 && val <= 24) {
-                cooldownLimitHours = val;
-                document.getElementById('limit-cooldown-display').innerText = `${String(val).padStart(2, '0')}:00`;
-                addLogEntry(`Cooldown duration updated to ${val} hours.`);
-            }
-        }
-
-        // LOGGING SYSTEM
-        function addLogEntry(msg) {
-            const timestamp = new Date().toLocaleTimeString();
-            const logContainer = document.getElementById('log-container');
-            if (logContainer) {
-                const entry = document.createElement('div');
-                entry.className = "p-2 rounded bg-white border border-slate-200 flex justify-between items-center shadow-sm";
-                entry.innerHTML = `<span class="text-slate-800 font-medium">${msg}</span><span class="text-[10px] text-slate-400">${timestamp}</span>`;
-                logContainer.prepend(entry);
-            }
-
-            const tickerText = document.getElementById('latest-event-text');
-            if (tickerText) tickerText.innerText = `${timestamp} - ${msg}`;
-        }
-
-        function clearEventLogs() {
-            const logContainer = document.getElementById('log-container');
-            if (logContainer) logContainer.innerHTML = '';
+            document.getElementById('fault-banner').classList.add('hidden');
         }
 
         function dismissFaultAlert() {
-            const banner = document.getElementById('fault-banner');
-            if (banner) banner.classList.add('hidden');
+            document.getElementById('fault-banner').classList.add('hidden');
+        }
+
+        function resetCooldownTimer() {
+            document.getElementById('cooldown-timer-display').innerText = "00:00:00";
+        }
+
+        function saveWaterDuration() {
+            const val = document.getElementById('input-water-duration').value;
+            document.getElementById('limit-water-display').innerText = (val < 10 ? '0' : '') + val + ':00';
+            alert("Maximum water limit updated successfully!");
+        }
+
+        function saveCooldownDuration() {
+            const val = document.getElementById('input-cooldown-duration').value;
+            document.getElementById('limit-cooldown-display').innerText = val + ':00';
+            alert("Cooldown interval updated successfully!");
         }
 
         function triggerWifiAPMode() {
-            addLogEntry("ESP32 forced into AP Hotspot Setup Mode (192.168.4.1).");
-            alert("ESP32 is now broadasting Wi-Fi Setup AP Hotspot. Connect to 'SmartIrrigation_AP' to reconfigure network credentials.");
+            alert("ESP32 forced into AP Hotspot Setup mode (SmartIrrigation_AP).");
+        }
+
+        function clearEventLogs() {
+            document.getElementById('log-container').innerHTML = '<p class="text-slate-400 italic">Logs cleared.</p>';
         }
 
         function saveSettings() {
-            const user = document.getElementById('setting-aio-username').value;
-            if (user) {
-                addLogEntry(`Adafruit IO credentials saved for user '${user}'.`);
-                alert("Adafruit IO credentials updated successfully!");
-            }
+            alert("Adafruit IO credentials saved successfully!");
         }
-
-        // INITIALIZE DEFAULT LOG
-        addLogEntry("Smart Irrigation Pro Dashboard initialized.");
     </script>
 </body>
 </html>
