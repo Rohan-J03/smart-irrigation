@@ -489,8 +489,20 @@
         Smart Irrigation Pro • Self-Managed Cloud Architecture • ESP32 & Adafruit IO
     </footer>
 
-    <!-- DASHBOARD CONTROLLER SCRIPT -->
+    <!-- DASHBOARD CONTROLLER & ADAFRUIT IO INTEGRATION SCRIPT -->
     <script>
+        // --- ADAFRUIT IO CONFIGURATION & LOCAL STORAGE SYNC ---
+        let AIO_USERNAME = localStorage.getItem('aio_username') || "Your_Adafruit_IO_Username";
+        let AIO_KEY = localStorage.getItem('aio_key') || "aio_Your_Adafruit_IO_Key_Here";
+
+        // Pre-fill settings form on load if credentials exist
+        if (AIO_USERNAME !== "Your_Adafruit_IO_Username") {
+            document.getElementById('setting-aio-username').value = AIO_USERNAME;
+        }
+        if (AIO_KEY !== "aio_Your_Adafruit_IO_Key_Here") {
+            document.getElementById('setting-aio-key').value = AIO_KEY;
+        }
+
         function switchTab(tabId) {
             ['overview', 'timers', 'diagnostics', 'logs', 'settings'].forEach(t => {
                 document.getElementById('tab-' + t).classList.add('hidden');
@@ -507,6 +519,7 @@
             if (!el.checked) {
                 manualCard.classList.remove('opacity-50', 'pointer-events-none');
                 document.getElementById('active-mode-label').innerText = "MANUAL OVERRIDE";
+                sendCloudCommand('valve-status', 0); // Default safe sync
             } else {
                 manualCard.classList.add('opacity-50', 'pointer-events-none');
                 document.getElementById('toggle-manual-water').checked = false;
@@ -521,10 +534,12 @@
                 badge.innerText = "VALVE OPEN (MANUAL)";
                 badge.className = "text-xl font-black tracking-wide text-emerald-600";
                 icon.className = "w-16 h-16 rounded-full bg-emerald-100 text-emerald-600 flex items-center justify-center text-2xl border border-emerald-300 mb-3 transition-all duration-300 shadow-sm";
+                sendCloudCommand('valve-status', 1);
             } else {
                 badge.innerText = "VALVE CLOSED";
                 badge.className = "text-xl font-black tracking-wide text-slate-500";
                 icon.className = "w-16 h-16 rounded-full bg-slate-200 text-slate-400 flex items-center justify-center text-2xl border border-slate-300 mb-3 transition-all duration-300 shadow-sm";
+                sendCloudCommand('valve-status', 0);
             }
         }
 
@@ -533,6 +548,7 @@
             document.getElementById('estop-status-badge').className = "text-[10px] bg-rose-100 text-rose-800 border border-rose-300 px-2 py-0.5 rounded-full font-bold animate-pulse";
             document.getElementById('fault-banner').classList.remove('hidden');
             document.getElementById('fault-banner-text').innerText = "Emergency Stop triggered manually. 230V Relay forcefully cut.";
+            sendCloudCommand('valve-status', 0);
         }
 
         function resetEmergencyStop() {
@@ -570,8 +586,108 @@
         }
 
         function saveSettings() {
+            const user = document.getElementById('setting-aio-username').value.trim();
+            const key = document.getElementById('setting-aio-key').value.trim();
+            
+            if (!user || !key) {
+                alert("Please fill in both Adafruit IO fields.");
+                return;
+            }
+
+            localStorage.setItem('aio_username', user);
+            localStorage.setItem('aio_key', key);
+            AIO_USERNAME = user;
+            AIO_KEY = key;
+
             alert("Adafruit IO credentials saved successfully!");
+            switchTab('overview');
+            fetchCloudTelemetry();
         }
+
+        // --- LIVE CLOUD TELEMETRY POLLING & COMMAND SYNC ---
+        function fetchCloudTelemetry() {
+            if (!AIO_USERNAME || AIO_USERNAME.includes("Your_")) return;
+
+            // 1. Fetch Soil Moisture Feed
+            fetch(`https://io.adafruit.com/api/v2/${AIO_USERNAME}/feeds/soil-moisture/data/last`, {
+                headers: { 'X-AIO-Key': AIO_KEY }
+            })
+            .then(res => res.json())
+            .then(data => {
+                let adcVal = parseInt(data.value);
+                if (isNaN(adcVal)) return;
+
+                // Update UI elements
+                document.getElementById('moisture-adc').innerText = adcVal + " ADC";
+                document.getElementById('diag-adc-val').innerText = adcVal + " ADC";
+
+                // Calculate visual percentage roughly (scale 3800 dry to 1200 wet)
+                let pct = Math.max(0, Math.min(100, Math.round(((3800 - adcVal) / (3800 - 1200)) * 100)));
+                document.getElementById('moisture-percent').innerText = pct + "%";
+                
+                // Update SVG gauge stroke offset (dasharray 283)
+                let offset = 283 - (283 * pct) / 100;
+                document.getElementById('gauge-circle').style.strokeDashoffset = offset;
+
+                let statusText = document.getElementById('moisture-status-text');
+                if (adcVal >= 2800) {
+                    statusText.innerText = "Dry (Needs Water)";
+                    statusText.className = "text-xs font-bold text-amber-700 bg-amber-100 px-2.5 py-1 rounded-full mt-2 border border-amber-300";
+                } else {
+                    statusText.innerText = "Optimal Moisture";
+                    statusText.className = "text-xs font-bold text-emerald-700 bg-emerald-100 px-2.5 py-1 rounded-full mt-2 border border-emerald-300";
+                }
+            })
+            .catch(err => console.error("Error fetching soil moisture:", err));
+
+            // 2. Fetch Valve Status Feed
+            fetch(`https://io.adafruit.com/api/v2/${AIO_USERNAME}/feeds/valve-status/data/last`, {
+                headers: { 'X-AIO-Key': AIO_KEY }
+            })
+            .then(res => res.json())
+            .then(data => {
+                let valveOpen = parseInt(data.value) === 1;
+                let badge = document.getElementById('valve-state-title');
+                let icon = document.getElementById('valve-icon-container');
+                
+                if (valveOpen) {
+                    badge.innerText = "VALVE OPEN (LIVE)";
+                    badge.className = "text-xl font-black tracking-wide text-emerald-600";
+                    icon.className = "w-16 h-16 rounded-full bg-emerald-100 text-emerald-600 flex items-center justify-center text-2xl border border-emerald-300 mb-3 transition-all duration-300 shadow-sm";
+                } else {
+                    badge.innerText = "VALVE CLOSED";
+                    badge.className = "text-xl font-black tracking-wide text-slate-500";
+                    icon.className = "w-16 h-16 rounded-full bg-slate-200 text-slate-400 flex items-center justify-center text-2xl border border-slate-300 mb-3 transition-all duration-300 shadow-sm";
+                }
+            })
+            .catch(err => console.error("Error fetching valve status:", err));
+        }
+
+        // Send command updates to Adafruit IO
+        function sendCloudCommand(feedName, value) {
+            if (!AIO_USERNAME || AIO_USERNAME.includes("Your_")) return;
+
+            fetch(`https://io.adafruit.com/api/v2/${AIO_USERNAME}/feeds/${feedName}/data`, {
+                method: 'POST',
+                headers: {
+                    'Content-Type': 'application/json',
+                    'X-AIO-Key': AIO_KEY
+                },
+                body: JSON.stringify({ value: value })
+            })
+            .then(res => res.json())
+            .then(data => {
+                console.log(`Cloud command posted to ${feedName}:`, data);
+                setTimeout(fetchCloudTelemetry, 800);
+            })
+            .catch(err => console.error("Error posting cloud command:", err));
+        }
+
+        // Poll cloud data every 10 seconds automatically
+        setInterval(fetchCloudTelemetry, 10000);
+
+        // Initial fetch on page load
+        fetchCloudTelemetry();
     </script>
 </body>
 </html>
